@@ -196,7 +196,8 @@ ForwardResult MegaMoeBF16Forward(torch::Tensor context, torch::Tensor x, torch::
                                  torch::Tensor topkWeights, torch::Tensor weight1, torch::Tensor weight2,
                                  int64_t maxRecvTokens, int rank, int worldSize, std::size_t symmetricBufferBytes,
                                  uint64_t ffts_addr, void* symmetricBuffer, double swigluLimit,
-                                 const std::string& save_gmm1_output)
+                                 const std::string& save_gmm1_output, const std::string& activation,
+                                 double act_beta_gate, double act_beta_up)
 {
     CheckNpuContiguous(x, "x");
     CheckNpuContiguous(topkIds, "topk_ids");
@@ -237,7 +238,8 @@ ForwardResult MegaMoeBF16Forward(torch::Tensor context, torch::Tensor x, torch::
     MegaMoeTilingData tiling{};
     const auto hostTiling =
         detail::MakeMegaMoeHostTiling(tiling, m, k, n, topk, worldSize, expertPerRank, maxRecvTokens, rank, true,
-                                      swigluLimit, true, save_gmm1_output, topkWeightType);
+                                      swigluLimit, true, save_gmm1_output, topkWeightType, activation, act_beta_gate,
+                                      act_beta_up);
     tiling.transW = weightLayout.transW;
     tiling.transW2 = weightLayout.transW;
     const auto earlyWeightBuffers = detail::GetBf16EarlyTopkWeightBufferBytes(tiling);
@@ -293,7 +295,8 @@ BackwardResult MegaMoeBF16Backward(torch::Tensor context, torch::Tensor gradY, t
                                    torch::Tensor trainingSavedState, torch::Tensor dispatchOutput,
                                    int64_t maxRecvTokens, int rank, int worldSize, std::size_t symmetricBufferBytes,
                                    uint64_t ffts_addr, void* symmetricBuffer, double swigluLimit,
-                                   const std::string& save_gmm1_output)
+                                   const std::string& save_gmm1_output, const std::string& activation,
+                                   double act_beta_gate, double act_beta_up)
 {
     const int64_t m = gradY.size(0);
     const int64_t k = gradY.size(1);
@@ -345,7 +348,8 @@ BackwardResult MegaMoeBF16Backward(torch::Tensor context, torch::Tensor gradY, t
     MegaMoeTilingData tiling{};
     const auto hostTiling =
         detail::MakeMegaMoeHostTiling(tiling, m, k, n, topk, worldSize, expertPerRank, maxRecvTokens, rank, true,
-                                      swigluLimit, true, save_gmm1_output, topkWeightType);
+                                      swigluLimit, true, save_gmm1_output, topkWeightType, activation, act_beta_gate,
+                                      act_beta_up);
     tiling.transW = weightLayout.transW;
     tiling.transW2 = weightLayout.transW;
     const auto earlyWeightBuffers = detail::GetBf16EarlyTopkWeightBufferBytes(tiling);
@@ -471,23 +475,26 @@ void BF16Executor::close()
 
 ops::ForwardResult BF16Executor::forward(torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_weights,
                                          torch::Tensor weight1, torch::Tensor weight2, int64_t max_recv_tokens,
-                                         double swiglu_limit, const std::string& save_gmm1_output)
+                                         double swiglu_limit, const std::string& save_gmm1_output,
+                                         const std::string& activation, double act_beta_gate, double act_beta_up)
 {
     TORCH_CHECK(address_ != 0, "training operator has been closed");
     return ops::MegaMoeBF16Forward(Context(x), x, topk_ids, topk_weights, weight1, weight2, max_recv_tokens, rank_,
                                    world_size_, SymmetricBufferBytes(), ffts_addr_, SymmetricBuffer(), swiglu_limit,
-                                   save_gmm1_output);
+                                   save_gmm1_output, activation, act_beta_gate, act_beta_up);
 }
 
 ops::BackwardResult BF16Executor::backward(torch::Tensor grad_y, torch::Tensor topk_weights, torch::Tensor weight1,
                                            torch::Tensor weight2, torch::Tensor counts, torch::Tensor saved_state,
                                            torch::Tensor dispatch_output, int64_t max_recv_tokens, double swiglu_limit,
-                                           const std::string& save_gmm1_output)
+                                           const std::string& save_gmm1_output, const std::string& activation,
+                                           double act_beta_gate, double act_beta_up)
 {
     TORCH_CHECK(address_ != 0, "training operator has been closed");
     return ops::MegaMoeBF16Backward(Context(grad_y), grad_y, topk_weights, weight1, weight2, counts, saved_state,
                                     dispatch_output, max_recv_tokens, rank_, world_size_, SymmetricBufferBytes(),
-                                    ffts_addr_, SymmetricBuffer(), swiglu_limit, save_gmm1_output);
+                                    ffts_addr_, SymmetricBuffer(), swiglu_limit, save_gmm1_output, activation,
+                                    act_beta_gate, act_beta_up);
 }
 
 torch::Tensor BF16Executor::Context(const torch::Tensor& like)

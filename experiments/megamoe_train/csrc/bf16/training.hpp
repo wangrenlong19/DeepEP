@@ -32,14 +32,17 @@ ForwardResult MegaMoeBF16Forward(torch::Tensor context, torch::Tensor x, torch::
                                  torch::Tensor topk_weights, torch::Tensor weight1, torch::Tensor weight2,
                                  int64_t max_recv_tokens, int rank, int world_size, std::size_t symmetric_buffer_bytes,
                                  uint64_t ffts_addr, void* symmetric_buffer, double swiglu_limit = 0.0,
-                                 const std::string& save_gmm1_output = "bf16");
+                                 const std::string& save_gmm1_output = "bf16", const std::string& activation = "swiglu",
+                                 double act_beta_gate = 4.0, double act_beta_up = 25.0);
 
 BackwardResult MegaMoeBF16Backward(torch::Tensor context, torch::Tensor grad_y, torch::Tensor topk_weights,
                                    torch::Tensor weight1, torch::Tensor weight2, torch::Tensor expert_token_nums,
                                    torch::Tensor training_saved_state, torch::Tensor dispatch_output,
                                    int64_t max_recv_tokens, int rank, int world_size,
                                    std::size_t symmetric_buffer_bytes, uint64_t ffts_addr, void* symmetric_buffer,
-                                   double swiglu_limit = 0.0, const std::string& save_gmm1_output = "bf16");
+                                   double swiglu_limit = 0.0, const std::string& save_gmm1_output = "bf16",
+                                   const std::string& activation = "swiglu", double act_beta_gate = 4.0,
+                                   double act_beta_up = 25.0);
 
 }  // namespace deepep::megamoe_train::ops
 
@@ -54,12 +57,14 @@ public:
 
     ops::ForwardResult forward(torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_weights,
                                torch::Tensor weight1, torch::Tensor weight2, int64_t max_recv_tokens,
-                               double swiglu_limit, const std::string& save_gmm1_output);
+                               double swiglu_limit, const std::string& save_gmm1_output,
+                               const std::string& activation, double act_beta_gate, double act_beta_up);
 
     ops::BackwardResult backward(torch::Tensor grad_y, torch::Tensor topk_weights, torch::Tensor weight1,
                                  torch::Tensor weight2, torch::Tensor counts, torch::Tensor saved_state,
                                  torch::Tensor dispatch_output, int64_t max_recv_tokens, double swiglu_limit,
-                                 const std::string& save_gmm1_output);
+                                 const std::string& save_gmm1_output, const std::string& activation,
+                                 double act_beta_gate, double act_beta_up);
 
 private:
     torch::Tensor Context(const torch::Tensor& like);

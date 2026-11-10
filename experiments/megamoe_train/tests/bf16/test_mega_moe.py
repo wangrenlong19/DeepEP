@@ -75,7 +75,7 @@ def parse_args(argv=None):
         default=None,
         help="Explicit ATK ratio limits; default 5 / 1.5 / 1.5, number_count_radio stays 2",
     )
-    parser.add_argument("--suite", choices=("priority", "model", "dtype", "gather", "all"), default=None)
+    parser.add_argument("--suite", choices=("priority", "model", "dtype", "gather", "situ", "all"), default=None)
     parser.add_argument(
         "--skip-mxfp8",
         action="store_true",
@@ -134,6 +134,18 @@ def parse_args(argv=None):
     )
     parser.add_argument("--save-gmm1-output", choices=("none", "bf16", "mxfp8", "auto"), default="bf16")
     parser.add_argument("--swiglu-limit", type=float, default=0.0)
+    parser.add_argument(
+        "--activation",
+        choices=("swiglu", "situglu"),
+        default="swiglu",
+        help="FFN activation family; situglu is Kimi K3 SiTU-GLU and requires swiglu_limit <= 0",
+    )
+    parser.add_argument(
+        "--act-betas",
+        default="4.0,25",
+        help="SiTU-GLU (beta_gate,beta_up) as comma-separated floats; an empty second entry "
+        "(e.g. 4.0,) keeps the up branch linear; only used for --activation situglu",
+    )
     parser.add_argument("--seed", type=int, default=20260825)
     parser.add_argument("--chunk-rows", type=int, default=256, help="CPU FP64 expert-row chunk size")
     parser.add_argument("--warmup", type=int, default=5)
@@ -200,6 +212,8 @@ def parse_args(argv=None):
             "--data-profile",
             "--save-gmm1-output",
             "--swiglu-limit",
+            "--activation",
+            "--act-betas",
             "--seed",
         }
         if any(token.partition("=")[0] in owned for token in (sys.argv[1:] if argv is None else argv)):
@@ -220,6 +234,28 @@ def parse_args(argv=None):
     if not math.isfinite(args.swiglu_limit) or abs(args.swiglu_limit) > float.fromhex("0x1.fffffep127"):
         parser.error("swiglu-limit must be finite and representable as float32")
     args.swiglu_limit = struct.unpack("f", struct.pack("f", args.swiglu_limit))[0]
+    # SiTU-GLU betas follow the "gate,up" comma convention; an empty second
+    # entry keeps the up branch linear (encoded as the 0.0 sentinel).
+    try:
+        parts = args.act_betas.split(",")
+        if len(parts) != 2:
+            raise ValueError
+        resolved_betas = [
+            4.0 if parts[0].strip().lower() in ("", "none") else float(parts[0]),
+            0.0 if parts[1].strip().lower() in ("", "none") else float(parts[1]),
+        ]
+    except ValueError:
+        parser.error(f"--act-betas must be (beta_gate,beta_up), got {args.act_betas!r}")
+    args.act_beta_gate, args.act_beta_up = struct.unpack(
+        "ff", struct.pack("ff", resolved_betas[0], resolved_betas[1])
+    )
+    if args.activation == "situglu":
+        if args.swiglu_limit > 0:
+            parser.error("situglu bounds both branches with its own softcap; swiglu-limit must be <= 0")
+        if not args.act_beta_gate > 0:
+            parser.error("--act-betas beta_gate must be positive for situglu")
+        if args.act_beta_up < 0:
+            parser.error("--act-betas beta_up must be 0 (linear up) or positive for situglu")
     if not math.isfinite(args.routed_scaling_factor) or not 0 < args.routed_scaling_factor <= float.fromhex(
         "0x1.fep127"
     ):
@@ -274,7 +310,7 @@ def suite_cases(args, *, include_skipped=False):
         seen.add(identity)
         if not item.get("covers", "").strip():
             raise ValueError(f"Missing coverage rationale in {identity}")
-        if not item["suites"] or set(item["suites"]) - {"priority", "model", "dtype", "gather"}:
+        if not item["suites"] or set(item["suites"]) - {"priority", "model", "dtype", "gather", "situ"}:
             raise ValueError(f"Invalid suite membership in {identity}")
         unknown = set(item) - set(defaults) - {"id", "suites", "covers"}
         if unknown:
@@ -401,7 +437,8 @@ def case_progress(index, count, record, log_path):
         f"[CASE] {index + 1}/{count} {record['id']} "
         f"M={case['seq']} H={case['hidden']} F={case['ffn']} TopK={case['topk']} "
         f"E/rank={case['expert_per_rank']} save={case['save_gmm1_output']} data={case['data_profile']} "
-        f"clip={case['swiglu_limit']} p_scale={case['routed_scaling_factor']} "
+        f"clip={case['swiglu_limit']} act={case['activation']}/{case['act_betas']} "
+        f"p_scale={case['routed_scaling_factor']} "
         f"p={case['topk_weight_dtype']}/{case['topk_weight_values']} "
         f"log={log_path}",
         flush=True,
@@ -580,7 +617,9 @@ def run_suite(args):
             flush=True,
         )
     if args.list_cases:
-        print("id\tEP\tM/rank\tH\tF\tTopK\tE/rank\trouting\tdata\tsave\tclip\tp_scale\tp_dtype\tp_values\tseed\tcovers")
+        print(
+            "id\tEP\tM/rank\tH\tF\tTopK\tE/rank\trouting\tdata\tsave\tclip\tact\tp_scale\tp_dtype\tp_values\tseed\tcovers"
+        )
         for case in cases:
             print(
                 "\t".join(
@@ -598,6 +637,7 @@ def run_suite(args):
                             case["data_profile"],
                             case["save_gmm1_output"],
                             case["swiglu_limit"],
+                            f"{case['activation']}/{case['act_betas']}",
                             case["routed_scaling_factor"],
                             case["topk_weight_dtype"],
                             case["topk_weight_values"],
@@ -945,7 +985,10 @@ def local_truth(inputs, args, rank):
 
     from cpu_reference import run_reference
 
-    result = run_reference(inputs, rank * args.expert_per_rank, args.chunk_rows, args.swiglu_limit)
+    result = run_reference(
+        inputs, rank * args.expert_per_rank, args.chunk_rows, args.swiglu_limit, args.activation,
+        (args.act_beta_gate, args.act_beta_up)
+    )
     sl = slice(rank * args.seq, (rank + 1) * args.seq)
     for name in ("y", "dx", "dtopk_weights"):
         dist.all_reduce(result[name])
@@ -1050,6 +1093,24 @@ def clip_gate_up(gate, up, limit):
     return gate.clamp_max(limit), up.clamp(-limit, limit)
 
 
+def baseline_activation(gate, up, activation, act_betas):
+    """Baseline activation formula; the backward replays the same graph.
+
+    SiTU-GLU (Kimi K3) softcaps both branches: A(g)*B(u) with
+    softcap(x, b) = b*tanh(x/b); beta_up == 0 keeps the up branch linear.
+    SiTU-GLU never clips, and its cases pass swiglu_limit=0, so the clip
+    above is a no-op for them.
+    """
+    import torch
+
+    if activation == "situglu":
+        beta_gate, beta_up = (float(value) for value in act_betas)
+        gate_act = beta_gate * torch.tanh(gate / beta_gate) * torch.sigmoid(gate)
+        up_act = up if beta_up == 0 else beta_up * torch.tanh(up / beta_up)
+        return gate_act * up_act
+    return torch.nn.functional.silu(gate) * up
+
+
 class BaselinePlan:
     """Row order, exchange splits, expert counts and weight views of one case."""
 
@@ -1060,6 +1121,8 @@ class BaselinePlan:
         "hidden",
         "local_experts",
         "swiglu_limit",
+        "activation",
+        "act_betas",
         "order",
         "route_row",
         "counts",
@@ -1105,6 +1168,7 @@ def baseline_plan(ids, w1, w2, group, args, rank, world, mode):
     plan.group = group
     plan.tokens, plan.topk, plan.hidden = tokens, topk, args.hidden
     plan.local_experts, plan.swiglu_limit, plan.recompute = local_experts, args.swiglu_limit, mode == "none"
+    plan.activation, plan.act_betas = args.activation, (args.act_beta_gate, args.act_beta_up)
     plan.order = order.to(ids.device)
     plan.route_row = (order // topk).to(ids.device)
     plan.counts = sent_to_us.sum(dim=0).to(ids.device)
@@ -1188,7 +1252,7 @@ def baseline_chain():
             )
             gate_up = _grouped_matmul(global_x, plan.weight1, counts)
             gate, up = clip_gate_up(*torch.chunk(gate_up, 2, dim=-1), plan.swiglu_limit)
-            activation = torch.nn.functional.silu(gate) * up
+            activation = baseline_activation(gate, up, plan.activation, plan.act_betas)
             if global_p.dtype == torch.float32:
                 # FP32 p must not promote the following BF16 GMM operands.
                 intermediate = (activation.float() * global_p.unsqueeze(-1)).to(activation.dtype)
@@ -1230,7 +1294,7 @@ def baseline_chain():
             )
             gate_up = _grouped_matmul(global_x, plan.weight1, counts) if plan.recompute else ctx.saved_tensors[2]
             gate, up = clip_gate_up(*torch.chunk(gate_up, 2, dim=-1), plan.swiglu_limit)
-            activation = torch.nn.functional.silu(gate) * up
+            activation = baseline_activation(gate, up, plan.activation, plan.act_betas)
             if global_p.dtype == torch.float32:
                 intermediate = (activation.float() * global_p.unsqueeze(-1)).to(activation.dtype)
             else:
@@ -1249,7 +1313,9 @@ def baseline_chain():
                 replay = gate_up.detach().requires_grad_(True)
                 replay_gate, replay_up = clip_gate_up(*torch.chunk(replay, 2, dim=-1), plan.swiglu_limit)
                 (grad_gate_up,) = torch.autograd.grad(
-                    torch.nn.functional.silu(replay_gate) * replay_up, replay, grad_activation
+                    baseline_activation(replay_gate, replay_up, plan.activation, plan.act_betas),
+                    replay,
+                    grad_activation,
                 )
             grad_x = _grouped_matmul(grad_gate_up, weight1_transposed, counts)
             grad_w1 = _grouped_wgrad(global_x, grad_gate_up, counts)
@@ -1294,7 +1360,16 @@ def measure(op, tensors, capacity, args, mode):
     def megamoe_forward():
         reset()
         y, counts = op(
-            x, ids, p, w1, w2, capacity, save_gmm1_output=args.save_gmm1_output, swiglu_limit=args.swiglu_limit
+            x,
+            ids,
+            p,
+            w1,
+            w2,
+            capacity,
+            save_gmm1_output=args.save_gmm1_output,
+            swiglu_limit=args.swiglu_limit,
+            activation=args.activation,
+            act_betas=(args.act_beta_gate, args.act_beta_up),
         )
         return y, counts
 
@@ -1566,6 +1641,8 @@ def execute_case(local_rank, args, rank, world, op, local_mem, phase_seconds, ex
                     args.swiglu_limit,
                     reference="bigop",
                     trace=trace if mode == "bf16" else None,
+                    activation=args.activation,
+                    act_betas=(args.act_beta_gate, args.act_beta_up),
                 ),
                 args,
                 rank,
@@ -1579,7 +1656,14 @@ def execute_case(local_rank, args, rank, world, op, local_mem, phase_seconds, ex
             with phase("megamoe_contract_reference"):
                 mixed_baseline = combine_baseline(
                     run_baseline(
-                        inputs, f"npu:{local_rank}", rank * args.expert_per_rank, mode, args.swiglu_limit, trace=trace
+                        inputs,
+                        f"npu:{local_rank}",
+                        rank * args.expert_per_rank,
+                        mode,
+                        args.swiglu_limit,
+                        trace=trace,
+                        activation=args.activation,
+                        act_betas=(args.act_beta_gate, args.act_beta_up),
                     ),
                     args,
                     rank,
@@ -1612,7 +1696,16 @@ def execute_case(local_rank, args, rank, world, op, local_mem, phase_seconds, ex
     # close while peers may still be executing a different operation.
     with phase("fused_forward_backward"):
         y, counts = op(
-            x, ids, p, w1, w2, capacity, save_gmm1_output=args.save_gmm1_output, swiglu_limit=args.swiglu_limit
+            x,
+            ids,
+            p,
+            w1,
+            w2,
+            capacity,
+            save_gmm1_output=args.save_gmm1_output,
+            swiglu_limit=args.swiglu_limit,
+            activation=args.activation,
+            act_betas=(args.act_beta_gate, args.act_beta_up),
         )
         y.backward(dy)
         torch.npu.synchronize()
@@ -1683,7 +1776,16 @@ def execute_case(local_rank, args, rank, world, op, local_mem, phase_seconds, ex
                 for leaf in (x, p, w1, w2):
                     leaf.grad = None
                 control_y, control_counts = op(
-                    x, ids, p, w1, w2, capacity, save_gmm1_output=save_mode, swiglu_limit=args.swiglu_limit
+                    x,
+                    ids,
+                    p,
+                    w1,
+                    w2,
+                    capacity,
+                    save_gmm1_output=save_mode,
+                    swiglu_limit=args.swiglu_limit,
+                    activation=args.activation,
+                    act_betas=(args.act_beta_gate, args.act_beta_up),
                 )
                 control_y.backward(dy)
                 torch.npu.synchronize()

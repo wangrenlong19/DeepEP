@@ -23,7 +23,9 @@ struct MegaMoeHostTiling {
 MegaMoeHostTiling MakeMegaMoeHostTiling(MegaMoeTilingData& tiling, int64_t m, int64_t k, int64_t n, int64_t topk,
                                         int64_t world_size, int64_t expert_per_rank, int64_t max_recv_tokens, int rank,
                                         bool bf16, double swiglu_limit, bool bf16_direct_dispatch,
-                                        const std::string& save_gmm1_output = "auto", uint32_t topk_weight_type = 0);
+                                        const std::string& save_gmm1_output = "auto", uint32_t topk_weight_type = 0,
+                                        const std::string& activation = "swiglu", double act_beta_gate = 4.0,
+                                        double act_beta_up = 25.0);
 
 MegaMoeHostTiling GetBf16EarlyTopkWeightBufferBytes(const MegaMoeTilingData& tiling);
 

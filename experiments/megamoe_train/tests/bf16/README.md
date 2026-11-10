@@ -67,7 +67,8 @@ python -u experiments/megamoe_train/tests/bf16/test_mega_moe.py 0,1,2,3,4,5,6,7 
 | 方式 | 说明 |
 | --- | --- |
 | `--suite priority` / `model` | 同一组 12 条模型用例 |
-| `--suite dtype` / `gather` / `all` | 分别选择 24 条类型/保存模式、6 条 FP32 Gather 边界、全部 42 条 |
+| `--suite dtype` / `gather` / `all` | 分别选择 24 条类型/保存模式、6 条 FP32 Gather 边界、全部用例 |
+| `--suite situ` | 4 条 SiTU-GLU（Kimi K3）用例：BF16/重算/MXFP8 保存与 linear_beta 线性 up 分支 |
 | `--case-id <id>`（可重复） | 在选中套件内取子集，例如 `--case-id pro_m4096 --case-id glm_m8192` |
 | `--list-cases` | 只打印配置，不导入 Torch/ATK、不访问设备 |
 | 不使用 `--suite` | 单 case 模式，全部参数由命令行给出（见下） |

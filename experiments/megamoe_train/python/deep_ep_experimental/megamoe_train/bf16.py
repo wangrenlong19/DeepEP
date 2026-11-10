@@ -15,6 +15,49 @@ from deep_ep._runtime import Runtime, integer
 from deep_ep._store import StoreGroup
 
 
+_KIMI_SITU_BETA_GATE_DEFAULT = 4.0
+_KIMI_SITU_BETA_UP_DEFAULT = 25.0
+
+
+def _resolve_activation(activation, swiglu_limit, act_betas):
+    """Validate and normalize the activation choice for MegaMoeBF16Train.
+
+    Returns (activation, act_beta_gate, act_beta_up) with the activation
+    name lowercased.  SiTU-GLU (Kimi K3) softcaps both branches and is
+    mutually exclusive with the dsv4 swiglu_limit hard clamp.
+
+    Betas: beta_gate must be positive.  beta_up follows the reference
+    implementation's linear_beta semantics: None (or 0) means the up
+    branch stays linear -- B(u) = u with no softcap -- and is encoded as
+    the 0.0 sentinel end to end; a positive value softcaps the branch.
+    """
+    name = str(activation).strip().lower().replace("-", "").replace("_", "")
+    if name not in ("swiglu", "situglu"):
+        raise ValueError(f"activation must be 'swiglu' or 'situglu', got {activation!r}")
+    if name == "situglu" and swiglu_limit and swiglu_limit > 0:
+        raise ValueError(
+            "swiglu_limit is incompatible with activation='situglu'; "
+            "SiTU-GLU bounds both branches with its own softcap"
+        )
+    if act_betas is None:
+        betas = [_KIMI_SITU_BETA_GATE_DEFAULT, _KIMI_SITU_BETA_UP_DEFAULT]
+    else:
+        if len(act_betas) != 2:
+            raise ValueError(f"act_betas must be (beta_gate, beta_up), got {act_betas!r}")
+        betas = [
+            _KIMI_SITU_BETA_GATE_DEFAULT if act_betas[0] is None else float(act_betas[0]),
+            0.0 if act_betas[1] is None else float(act_betas[1]),
+        ]
+    if name == "situglu":
+        if betas[0] <= 0:
+            raise ValueError(f"act_betas[0] (beta_gate) must be positive, got {betas[0]!r}")
+        if betas[1] < 0:
+            raise ValueError(
+                f"act_betas[1] (beta_up) must be None/0 (linear up branch) or positive, got {betas[1]!r}"
+            )
+    return name, betas[0], betas[1]
+
+
 class _TrainRuntime(Runtime):
     _megamoe_train = True
 
@@ -47,12 +90,16 @@ class _TrainRuntime(Runtime):
 
 class _MegaMoeBF16TrainFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, op, x, ids, weights, w1, w2, max_recv, limit, mode):
+    def forward(ctx, op, x, ids, weights, w1, w2, max_recv, limit, mode, activation, act_beta_gate, act_beta_up):
         op._check_ready()
         op._runtime.validate_topk_weight_type(weights.dtype, 0)
-        result = op._executor.forward(x, ids, weights, w1, w2, max_recv, limit, mode)
+        result = op._executor.forward(x, ids, weights, w1, w2, max_recv, limit, mode, activation, act_beta_gate,
+                                      act_beta_up)
         ctx.op = op
         ctx.max_recv, ctx.limit, ctx.mode = max_recv, limit, mode
+        # Backward rebuilds the tiling from the same activation settings; the
+        # 0.0 beta_up sentinel (linear up branch) flows through unchanged.
+        ctx.activation, ctx.act_beta_gate, ctx.act_beta_up = activation, act_beta_gate, act_beta_up
         ctx.save_for_backward(weights, w1, w2, result.counts, result.saved_state, result.dispatch_output)
         ctx.mark_non_differentiable(result.counts)
         return result.y, result.counts
@@ -75,8 +122,12 @@ class _MegaMoeBF16TrainFunction(torch.autograd.Function):
             ctx.max_recv,
             ctx.limit,
             ctx.mode,
+            ctx.activation,
+            ctx.act_beta_gate,
+            ctx.act_beta_up,
         )
-        return None, result.dx, None, result.dtopk_weights, result.dw1, result.dw2, None, None, None
+        return (None, result.dx, None, result.dtopk_weights, result.dw1, result.dw2, None, None, None, None, None,
+                None)
 
 
 class MegaMoeBF16Train(torch.nn.Module):
@@ -128,6 +179,8 @@ class MegaMoeBF16Train(torch.nn.Module):
         *,
         swiglu_limit=0.0,
         save_gmm1_output="bf16",
+        activation="swiglu",
+        act_betas=None,
     ):
         """Return (y, counts); autograd provides dX, dTopK, dW1 and dW2.
 
@@ -136,6 +189,14 @@ class MegaMoeBF16Train(torch.nn.Module):
         has the same dtype. All EP ranks must agree on that dtype per call.
         Expert IDs are int32. Weights use [E,2F,H]/[E,H,F], with legacy layouts
         [E,H,2F]/[E,F,H] retained. Counts are non-differentiable.
+
+        ``activation`` selects the FFN activation family: "swiglu" (default,
+        optionally with the dsv4 ``swiglu_limit`` clamp) or "situglu" (Kimi K3
+        SiTU-GLU, softcap(x, b) = b*tanh(x/b) on both branches). ``act_betas``
+        sets (beta_gate, beta_up), defaulting to Kimi K3's (4.0, 25.0); it is
+        ignored for swiglu, and swiglu_limit is rejected for situglu. The
+        saved gate/up state is activation-agnostic (raw values saved before
+        the activation); backward recomputes the matching derivative from it.
         """
         integer("max_recv_tokens", max_recv_tokens, 1, (1 << 31) - 1)
         limit = float(swiglu_limit)
@@ -143,8 +204,10 @@ class MegaMoeBF16Train(torch.nn.Module):
             raise ValueError("swiglu_limit must be finite and representable as float32")
         if save_gmm1_output not in ("bf16", "none", "mxfp8", "auto"):
             raise ValueError("save_gmm1_output must be bf16, none, mxfp8 or auto")
+        activation, act_beta_gate, act_beta_up = _resolve_activation(activation, limit, act_betas)
         return _MegaMoeBF16TrainFunction.apply(
-            self, x, topk_ids, topk_weights, w1, w2, max_recv_tokens, limit, save_gmm1_output
+            self, x, topk_ids, topk_weights, w1, w2, max_recv_tokens, limit, save_gmm1_output, activation,
+            act_beta_gate, act_beta_up
         )
 
     def close(self):

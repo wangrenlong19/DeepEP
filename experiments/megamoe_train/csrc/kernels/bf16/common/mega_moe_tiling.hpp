@@ -26,6 +26,24 @@ constexpr uint32_t BACKWARD_DP_PARTIAL_TILE_N = 256U;
 // up = clamp(up, -L, L). FLT_MAX disables the clamp.
 static constexpr float kMegaMoeSwigluLimitDisabled = 3.402823466e+38F;
 
+// Activation family for the BF16 training pipeline. SwiGLU keeps the dsv4
+// swiglu_limit clamp; SiTU-GLU (Kimi K3) applies a smooth softcap
+// softcap(x, b) = b * tanh(x / b) to both branches instead and is
+// incompatible with the hard clamp (the host rejects the combination).
+constexpr uint8_t kMegaMoeActivationSwiglu = 0;
+constexpr uint8_t kMegaMoeActivationSituGlu = 1;
+// Bit 0 selects the activation family. Higher bits are forward-epilogue
+// variant knobs: the host ORs kMegaMoeActivationTanhPackagedBit in by
+// default to swap the SiTU-GLU tanh from the register exp identity to the
+// packaged high-level Tanh. Family compares must mask with
+// kMegaMoeActivationKindMask; the backward epilogue strips the extra bits
+// when comparing the family.
+constexpr uint8_t kMegaMoeActivationKindMask = 0x01;
+constexpr uint8_t kMegaMoeActivationTanhPackagedBit = 0x02;
+// Kimi K3 defaults: beta_gate = 4, beta_up = 25.
+constexpr float kMegaMoeSituBetaGateDefault = 4.0F;
+constexpr float kMegaMoeSituBetaUpDefault = 25.0F;
+
 struct MegaMoeTilingData {
     MoeInitRoutingV3Arch35TilingData moeInitRoutingTilingData;
     uint32_t expertPerRank;
@@ -44,6 +62,12 @@ struct MegaMoeTilingData {
     bool transW2;
     // dsv4 swiglu_limit clamp; kMegaMoeSwigluLimitDisabled disables it.
     float swigluLimit;
+    // Activation family (kMegaMoeActivation*): 0 = SwiGLU, 1 = SiTU-GLU.
+    // Betas only apply to SiTU-GLU; paths that never assign them keep the
+    // SwiGLU default through the member initializers below.
+    uint8_t activationKind{kMegaMoeActivationSwiglu};
+    float actBetaGate{kMegaMoeSituBetaGateDefault};
+    float actBetaUp{kMegaMoeSituBetaUpDefault};
     // BF16 only: 0=auto, 1=none, 2=BF16, 3=MXFP8. Host resolves auto.
     uint32_t savedGateUpMode{2};
     // Ordinary BF16 only: Host resolves auto/diagnostic overrides and writes

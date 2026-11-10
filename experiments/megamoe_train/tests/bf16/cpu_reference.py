@@ -15,12 +15,26 @@ import torch.nn.functional as F
 
 
 @torch.enable_grad()
-def run_reference(inputs, expert_start, chunk_rows=256, swiglu_limit=0.0):
+def situ_activation(gate, up, act_betas):
+    """SiTU-GLU (Kimi K3): A(g)*B(u) with softcap(x, b) = b*tanh(x/b).
+
+    beta_up == 0 is the reference implementation's unspecified linear_beta:
+    the up branch stays linear and only the gate is softcapped.
+    """
+    beta_gate, beta_up = (float(value) for value in act_betas)
+    gate_act = beta_gate * torch.tanh(gate / beta_gate) * torch.sigmoid(gate)
+    up_act = up if beta_up == 0 else beta_up * torch.tanh(up / beta_up)
+    return gate_act * up_act
+
+
+def run_reference(inputs, expert_start, chunk_rows=256, swiglu_limit=0.0, activation="swiglu", act_betas=(4.0, 25.0)):
     """Return owned expert contributions; the runner reduces token results.
 
     Inputs are CPU Tensor snapshots with canonical w1=[E,2F,H], w2=[E,H,F].
     Returned floating-point tensors are detached CPU FP64 values. Chunking
     bounds the live autograd graph rather than retaining every routed token.
+    ``activation`` selects the FFN activation family; SiTU-GLU bounds both
+    branches with its own softcap and rejects a positive ``swiglu_limit``.
     """
     if chunk_rows <= 0:
         raise ValueError("chunk_rows must be positive")
@@ -41,6 +55,13 @@ def run_reference(inputs, expert_start, chunk_rows=256, swiglu_limit=0.0):
     limit = torch.tensor(swiglu_limit, dtype=torch.float32, device="cpu").item()
     if not math.isfinite(limit):
         raise ValueError("swiglu_limit must be representable as finite FP32")
+    if activation not in ("swiglu", "situglu"):
+        raise ValueError(f"activation must be swiglu or situglu, got {activation!r}")
+    if activation == "situglu":
+        if limit > 0:
+            raise ValueError("swiglu_limit is incompatible with activation='situglu'")
+        if len(act_betas) != 2 or float(act_betas[0]) <= 0 or float(act_betas[1]) < 0:
+            raise ValueError("act_betas must be (beta_gate > 0, beta_up >= 0)")
     x, p, dy = x.double(), p.double(), dy.double()
     result = {
         "y": torch.zeros_like(x),
@@ -64,7 +85,11 @@ def run_reference(inputs, expert_start, chunk_rows=256, swiglu_limit=0.0):
             gate, up = (chunk_x @ a.T).chunk(2, dim=-1)
             if limit > 0:
                 gate, up = gate.clamp_max(limit), up.clamp(-limit, limit)
-            output = ((F.silu(gate) * up) * probability) @ b.T
+            if activation == "situglu":
+                activation_output = situ_activation(gate, up, act_betas)
+            else:
+                activation_output = F.silu(gate) * up
+            output = (activation_output * probability) @ b.T
             dx, dp, dw1, dw2 = torch.autograd.grad(output, (chunk_x, probability, a, b), grad_outputs=dy[token])
             with torch.no_grad():
                 result["y"].index_add_(0, token, output.detach())

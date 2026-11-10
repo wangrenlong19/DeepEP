@@ -97,6 +97,41 @@ def _swiglu_fp32(gate_up, limit, raw=None):
     return silu * up
 
 
+def _situ_fp32(gate_up, limit, raw=None, act_betas=(4.0, 25.0)):
+    """SiTU-GLU forward in FP32: A(g)*B(u), softcap(x, b) = b*tanh(x/b).
+
+    SiTU-GLU never takes the hard clamp (the runner rejects limit > 0), so
+    ``limit`` and the MXFP8 ``raw`` masks are accepted for signature parity
+    only. beta_up == 0 keeps the up branch linear.
+    """
+    gate, up, _, _ = _activation_operands(gate_up, limit, raw)
+    beta_gate, beta_up = (float(value) for value in act_betas)
+    gate_act = beta_gate * torch.tanh(gate / beta_gate) / (1.0 + torch.exp(-gate))
+    up_act = up if beta_up == 0 else beta_up * torch.tanh(up / beta_up)
+    return gate_act * up_act
+
+
+def _situ_backward_fp32(grad_h, gate_up, limit, raw=None, act_betas=(4.0, 25.0)):
+    """SiTU-GLU derivative in FP32; only dGate/dUp are BF16 outputs.
+
+    dGate = dA * A'(g) with A'(g) = (1 - t1^2)*sig + beta_gate*t1*sig*(1 - sig);
+    dUp = dA * A(g) * B'(u) with B'(u) = 1 - tanh(u/beta_up)^2 (linear up: 1).
+    """
+    gate, up, _, _ = _activation_operands(gate_up, limit, raw)
+    beta_gate, beta_up = (float(value) for value in act_betas)
+    t1 = torch.tanh(gate / beta_gate)
+    sigmoid = 1.0 / (1.0 + torch.exp(-gate))
+    gate_act = beta_gate * t1 * sigmoid
+    da = grad_h.float() * (up if beta_up == 0 else beta_up * torch.tanh(up / beta_up))
+    dg = da * ((1.0 - t1 * t1) * sigmoid + beta_gate * t1 * sigmoid * (1.0 - sigmoid))
+    if beta_up == 0:
+        du = da
+    else:
+        t2 = torch.tanh(up / beta_up)
+        du = da * gate_act * (1.0 - t2 * t2)
+    return torch.cat((dg, du), dim=-1).to(gate_up.dtype)
+
+
 def _swiglu_backward_fp32(grad_h, gate_up, limit, raw=None):
     """Keep dH and the derivative in FP32; only dGate/dUp are BF16 outputs."""
     gate, up, gate_mask, up_mask = _activation_operands(gate_up, limit, raw)
@@ -109,18 +144,43 @@ def _swiglu_backward_fp32(grad_h, gate_up, limit, raw=None):
     return torch.cat((dg, du), dim=-1).to(gate_up.dtype)
 
 
+def _activation_pair(activation):
+    """Return the (forward, backward) FP32 activation helpers for a family."""
+    if activation == "situglu":
+        return _situ_fp32, _situ_backward_fp32
+    if activation == "swiglu":
+        return _swiglu_fp32, _swiglu_backward_fp32
+    raise ValueError(f"activation must be swiglu or situglu, got {activation!r}")
+
+
 @torch.no_grad()
-def run_baseline(inputs, device, expert_start, save_mode="bf16", swiglu_limit=0.0, *, reference="megamoe", trace=None):
+def run_baseline(
+    inputs,
+    device,
+    expert_start,
+    save_mode="bf16",
+    swiglu_limit=0.0,
+    *,
+    reference="megamoe",
+    trace=None,
+    activation="swiglu",
+    act_betas=(4.0, 25.0),
+):
     """Run the selected reference with public w1=[E,2F,H], w2=[E,H,F].
 
     Pack expert-major, then source-rank/token order. The reference names select
     reporting roles, not different rounding rules. Forward stays uncompressed;
     backward reuses saved Gate/Up or recomputes them for save=none.
+    ``activation`` selects the FFN activation family (SiTU-GLU softcaps both
+    branches and requires ``swiglu_limit <= 0``).
     """
     if save_mode not in ("none", "bf16", "mxfp8"):
         raise ValueError(f"Unresolved save mode: {save_mode}")
     if reference not in ("megamoe", "bigop"):
         raise ValueError(f"Unknown NPU reference: {reference}")
+    act_forward, act_backward = _activation_pair(activation)
+    if activation == "situglu" and swiglu_limit > 0:
+        raise ValueError("swiglu_limit is incompatible with activation='situglu'")
     ids = inputs["ids"]
     indices = [(ids == expert_start + expert).nonzero(as_tuple=True) for expert in range(len(inputs["w1"]))]
     counts = torch.tensor([rows.numel() for rows, _ in indices], dtype=torch.int64, device="cpu")
@@ -150,20 +210,20 @@ def run_baseline(inputs, device, expert_start, save_mode="bf16", swiglu_limit=0.
     weight1 = tensor(inputs["w1"].transpose(1, 2))
     weight2 = tensor(inputs["w2"].transpose(1, 2))
     forward_z = _grouped_matmul(x, weight1, counts)
-    forward_h = _swiglu_fp32(forward_z, swiglu_limit)
+    forward_h = act_forward(forward_z, swiglu_limit, act_betas=act_betas)
     forward_hp = (forward_h * p.float()).to(forward_z.dtype)
     y = _grouped_matmul(forward_hp, weight2, counts)
 
     raw_z = _grouped_matmul(x, weight1, counts) if save_mode == "none" else forward_z
     z = _mxfp8_saved_roundtrip(raw_z) if save_mode == "mxfp8" else raw_z
     raw = raw_z if save_mode == "mxfp8" else None
-    h = _swiglu_fp32(z, swiglu_limit, raw)
+    h = act_forward(z, swiglu_limit, raw, act_betas=act_betas)
     hp = (h * p.float()).to(z.dtype)
     dhp = _grouped_matmul(dy, weight2.transpose(1, 2).contiguous(), counts)
     dw2 = _grouped_wgrad(hp, dy, counts).reshape_as(weight2).transpose(1, 2).contiguous()
     dp = (dhp.float() * h).sum(dim=-1).to(p.dtype)
     grad_swiglu = dhp.float() * p.float()
-    dz = _swiglu_backward_fp32(grad_swiglu, z, swiglu_limit, raw)
+    dz = act_backward(grad_swiglu, z, swiglu_limit, raw, act_betas=act_betas)
     dx = _grouped_matmul(dz, weight1.transpose(1, 2).contiguous(), counts)
     dw1 = _grouped_wgrad(x, dz, counts).reshape_as(weight1).transpose(1, 2).contiguous()
     if trace is not None:

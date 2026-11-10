@@ -303,7 +303,11 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::Init(GM_ADDR context, G
     epilogueOp_.Init({gatePlane, upPlane, savedState_.ptrSavedGateScale, savedState_.ptrSavedUpScale,
                       savedState_.ptrSavedGateHigh, savedState_.ptrSavedUpLow, savedState_.ptrSavedUpHigh,
                       bwWs_.ptrGradZ, bwWs_.ptrHp, bwWs_.ptrDpProducts, savedState_.ptrDispatchedTopkWeights, 0, 0,
-                      tilingData->swigluLimit, savedGateUpMode_});
+                      tilingData->swigluLimit, savedGateUpMode_,
+                      // The packaged-Tanh bit flows through to the backward
+                      // epilogue; its dispatchers mask the family bits before
+                      // comparing.
+                      tilingData->activationKind, tilingData->actBetaGate, tilingData->actBetaUp});
     epilogueOp_.UpdateNextProblem({0, n_, 0, 0});
 }
 

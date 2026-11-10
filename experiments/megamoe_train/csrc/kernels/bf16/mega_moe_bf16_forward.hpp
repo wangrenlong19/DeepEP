@@ -243,7 +243,10 @@ __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::Init(
                       params_.workspaceInfo.ptrSavedGate, params_.workspaceInfo.ptrSavedUp,
                       params_.workspaceInfo.ptrSavedGateScale, params_.workspaceInfo.ptrSavedUpScale,
                       params_.workspaceInfo.ptrSavedGateHigh, params_.workspaceInfo.ptrSavedUpLow,
-                      params_.workspaceInfo.ptrSavedUpHigh});
+                      params_.workspaceInfo.ptrSavedUpHigh,
+                      // Activation family (bit 0) with the forward-epilogue
+                      // variant bits (packaged Tanh) flowing through.
+                      tilingData->activationKind, tilingData->actBetaGate, tilingData->actBetaUp});
     perRankStridesInTokenPerExpert_ =
         Ops::Base::CeilAlign(static_cast<uint32_t>(worldSize_ * expertPerRank_), static_cast<uint32_t>(ALIGN_128));
     tokenPerExpertCurRankAddr_ =

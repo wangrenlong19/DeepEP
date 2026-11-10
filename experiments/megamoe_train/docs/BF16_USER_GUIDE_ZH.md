@@ -84,12 +84,13 @@ endpoint 不是窗口内存地址，也不决定 NPU 数据通过哪种引擎传
 
 ### 3.2 前向
 
-通过 `op(...)` 调用前向；`swiglu_limit` 和 `save_gmm1_output` 仅接受关键字传参：
+通过 `op(...)` 调用前向；`swiglu_limit`、`save_gmm1_output`、`activation` 和 `act_betas` 仅接受关键字传参：
 
 ```python
 y, counts = op(
     x, topk_ids, topk_weights, w1, w2, max_recv_tokens,
     swiglu_limit=0.0, save_gmm1_output="bf16",
+    activation="swiglu", act_betas=None,
 )
 ```
 
@@ -104,6 +105,8 @@ y, counts = op(
 | `w2` | BF16 `[E,K,F]` | 本 rank 的 Down 参数 |
 | `max_recv_tokens` | Python int，1..int32 最大值 | 本 rank 所有本地专家合计接收的路由行容量 |
 | `swiglu_limit` | 可表示为 float32 的有限数值 | <=0 关闭 clipping；正值 L 对 Gate 做上界 L 裁剪，对 Up 做 [-L,L] 裁剪 |
+| `activation` | `swiglu / situglu` | FFN 激活函数族，见下文"激活函数族与 SiTU-GLU" |
+| `act_betas` | `(beta_gate, beta_up)` 或 None | 仅 situglu 生效的软限幅系数，默认 None 即 K3 的 (4.0, 25.0) |
 | `save_gmm1_output` | `bf16 / none / mxfp8 / auto` | 供反向使用的 Gate/Up 保存形式 |
 | `y` | BF16 `[M,K]` | 已 combine 并恢复本 rank token 顺序的输出 |
 | `counts` | int32 `[E]` | 本地专家接收行数统计，不参与求导 |
@@ -111,6 +114,21 @@ y, counts = op(
 Tensor 输入必须 contiguous，全部位于构造时选定的同一 NPU。也支持 `w1=[E,K,2F]`、`w2=[E,F,K]` 的另一种布局；权重梯度保持输入布局。
 
 专家编号按 `ep_rank*E+local_expert` 解释。这里的 ep_rank 是 EP 组内 rank，适配层应据此排列本地专家权重，不能直接使用整个分布式任务的全局 rank 编号。
+
+#### 激活函数族与 SiTU-GLU（Kimi K3）
+
+`activation` 选择 FFN 激活函数族；激活设置随 autograd ctx 自动传入反向，四次梯度的激活行为始终与前向一致。
+
+- `swiglu`（默认）：`H = silu(gate) * up`，可选 `swiglu_limit` 硬裁剪；行为与旧版本逐位一致，`act_betas` 被忽略。
+- `situglu`（Kimi K3）：`softcap(x, b) = b·tanh(x/b)`；`A(g) = β₁·tanh(g/β₁)·σ(g)`，`B(u) = β₂·tanh(u/β₂)`，`H = A·B`，|H| ≤ β₁·β₂ = 100（默认 β 取值）。两个分支都被平滑软限幅，因此**与 `swiglu_limit > 0` 互斥**（Python 与 Host C++ 两层都拒绝），也没有裁剪掩码保存。
+
+`act_betas` 语义（仅 situglu）：
+
+- `None`（默认）取 K3 论文配置 `(4.0, 25.0)`；
+- `beta_gate` 必须为正；`beta_up` 遵循参考实现的 `linear_beta` 语义——**None/0 表示 up 分支线性**（`B(u) = u`，只软限幅 gate），端到端编码为 0.0 哨兵，例如 `act_betas=(4.0, None)`；正值则对该分支软限幅；
+- 名称大小写、`-`、`_` 不敏感（`"SiTU-GLU"` 等价 `"situglu"`）。
+
+SiTU-GLU 的 tanh 默认使用封装的高层 `AscendC::Tanh`（950PR/DT 上映射到硬件 tanh 指令）；设置环境变量 `MEGAMOE_ACT_TANH=0` 可切回寄存器 exp 恒等式实现（保留作回退与 A/B 归因）。两条路径的逐算子 BF16 舍入链完全一致，仅 FP32 内部 tanh 相差 ≤1 ulp。saved MXFP8 与封装 Tanh 的组合自动回退到公式路径（量化 epilogue 拥有工作 tile 之外的 UB）。数值链与内核实现见[设计文档](mega_moe_bf16_design.md)；设备验收用 `test_mega_moe.py --suite situ`。
 
 ### 3.3 自动求导与保存模式
 

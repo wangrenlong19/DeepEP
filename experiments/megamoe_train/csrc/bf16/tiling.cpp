@@ -47,7 +47,8 @@ namespace deepep::megamoe_train::ops::detail {
 MegaMoeHostTiling MakeMegaMoeHostTiling(MegaMoeTilingData& tiling, int64_t m, int64_t k, int64_t n, int64_t topk,
                                         int64_t world_size, int64_t expert_per_rank, int64_t max_recv_tokens, int rank,
                                         bool bf16, double swiglu_limit, bool bf16_direct_dispatch,
-                                        const std::string& save_gmm1_output, uint32_t topk_weight_type)
+                                        const std::string& save_gmm1_output, uint32_t topk_weight_type,
+                                        const std::string& activation, double act_beta_gate, double act_beta_up)
 {
     auto* platform = platform_ascendc::PlatformAscendCManager::GetInstance();
     const uint32_t aic_num = platform->GetCoreNumAic();
@@ -75,6 +76,49 @@ MegaMoeHostTiling MakeMegaMoeHostTiling(MegaMoeTilingData& tiling, int64_t m, in
 
     const float normalizedSwigluLimit =
         swiglu_limit > 0.0 ? static_cast<float>(swiglu_limit) : kMegaMoeSwigluLimitDisabled;
+    // Resolve the activation family once here so every caller downstream
+    // (kernel epilogues, saved-state layouts) sees a validated kind.
+    uint8_t activationKind = kMegaMoeActivationSwiglu;
+    if (activation == "situglu") {
+        activationKind = kMegaMoeActivationSituGlu;
+    } else {
+        TORCH_CHECK(activation == "swiglu", "activation must be swiglu or situglu, got '", activation, "'");
+    }
+    if (activationKind == kMegaMoeActivationSituGlu) {
+        // SiTU-GLU bounds both branches with its own smooth softcap; the
+        // dsv4 hard clamp is a different (mutually exclusive) stabilizer.
+        TORCH_CHECK(swiglu_limit <= 0.0,
+                    "swiglu_limit is incompatible with activation='situglu'; pass swiglu_limit=0");
+        // beta_up == 0 is the reference implementation's unspecified
+        // linear_beta: the up branch stays linear (B(u) = u).
+        TORCH_CHECK(act_beta_gate > 0.0, "act_betas[0] (beta_gate) must be positive for activation='situglu'");
+        TORCH_CHECK(act_beta_up >= 0.0,
+                    "act_betas[1] (beta_up) must be 0 (linear up branch) or positive for activation='situglu'");
+    }
+    // SiTU-GLU tanh selection (forward AND backward epilogues): the packaged
+    // high-level Tanh (hardware INTRINSIC algorithm on 950PR/DT) is the
+    // DEFAULT — at the K3-class bench shape it cut the fwd+bwd step by ~18%
+    // (fwd -4.1ms, bwd -4.7ms) with the precision gate green. The per-op BF16
+    // rounding chain is unchanged; only the FP32-internal tanh differs
+    // (<= 1 ulp). MEGAMOE_ACT_TANH=0 opts back into the original register
+    // exp-identity formula (kept as a fallback and for A/B attribution).
+    // The saved-MXFP8 combination always runs the formula path (kernel-side
+    // guard: the quant epilogue owns the UB beyond the work tiles).
+    if (activationKind == kMegaMoeActivationSituGlu) {
+        activationKind |= kMegaMoeActivationTanhPackagedBit;
+        const char* tanhMode = std::getenv("MEGAMOE_ACT_TANH");
+        if (tanhMode != nullptr) {
+            const std::string mode(tanhMode);
+            if (mode == "0" || mode == "false" || mode == "off") {
+                activationKind &= ~kMegaMoeActivationTanhPackagedBit;
+            } else {
+                TORCH_CHECK(mode == "1" || mode == "true" || mode == "on" || mode == "yes" || mode.empty(),
+                            "MEGAMOE_ACT_TANH must be 1/true/on/yes or 0/false/off, got '", mode, "'");
+            }
+        }
+    }
+    const float actBetaGate = static_cast<float>(act_beta_gate);
+    const float actBetaUp = static_cast<float>(act_beta_up);
     using namespace MegaMoeBF16Training;
     uint32_t saveMode = kSaveAuto;
     if (save_gmm1_output == "none")
@@ -106,6 +150,12 @@ MegaMoeHostTiling MakeMegaMoeHostTiling(MegaMoeTilingData& tiling, int64_t m, in
     TORCH_CHECK(ok, "failed to generate MegaMoe BF16 tiling data");
     tiling.swigluLimit = normalizedSwigluLimit;
     tiling.savedGateUpMode = saveMode;
+    // SetInitTilingData resets the struct defaults, so the activation fields
+    // must be written after it (the local activationKind carries the
+    // packaged-Tanh bit decision).
+    tiling.activationKind = activationKind;
+    tiling.actBetaGate = actBetaGate;
+    tiling.actBetaUp = actBetaUp;
     TORCH_CHECK(topk_weight_type <= kTopkWeightFp32, "unsupported TopK weight type");
     tiling.topkWeightType = topk_weight_type;
     tiling.compactTokenCountExchange =
