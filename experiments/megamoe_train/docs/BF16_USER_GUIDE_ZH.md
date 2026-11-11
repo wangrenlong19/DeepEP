@@ -128,7 +128,7 @@ Tensor 输入必须 contiguous，全部位于构造时选定的同一 NPU。也�
 - `beta_gate` 必须为正；`beta_up` 遵循参考实现的 `linear_beta` 语义——**None/0 表示 up 分支线性**（`B(u) = u`，只软限幅 gate），端到端编码为 0.0 哨兵，例如 `act_betas=(4.0, None)`；正值则对该分支软限幅；
 - 名称大小写、`-`、`_` 不敏感（`"SiTU-GLU"` 等价 `"situglu"`）。
 
-SiTU-GLU 的 tanh 默认使用封装的高层 `AscendC::Tanh`（950PR/DT 上映射到硬件 tanh 指令）；设置环境变量 `MEGAMOE_ACT_TANH=0` 可切回寄存器 exp 恒等式实现（保留作回退与 A/B 归因）。两条路径的逐算子 BF16 舍入链完全一致，仅 FP32 内部 tanh 相差 ≤1 ulp。saved MXFP8 与封装 Tanh 的组合自动回退到公式路径（量化 epilogue 拥有工作 tile 之外的 UB）。数值链与内核实现见[设计文档](mega_moe_bf16_design.md)；设备验收用 `test_mega_moe.py --suite situ`。
+SiTU-GLU 的数值约定与 swiglu 一致（激活 FP32 直通、`Hp` 单次舍入、梯度同边界），只是公式换成 softcap 组合。tanh 默认用寄存器 exp 恒等式实现；`MEGAMOE_ACT_TANH=1` 可显式启用封装的高层 `AscendC::Tanh`（950PR/DT 硬件 tanh 指令，仅 FP32 内部相差 ≤1 ulp；在该仓完成设备 A/B 前保持默认关闭）。saved MXFP8 与封装 Tanh 的组合自动回退到公式路径（量化 epilogue 拥有工作 tile 之外的 UB）。数值边界与内核实现见[设计文档](mega_moe_bf16_design.md)；设备验收用 `test_mega_moe.py --suite situ`。
 
 ### 3.3 自动求导与保存模式
 

@@ -95,24 +95,22 @@ MegaMoeHostTiling MakeMegaMoeHostTiling(MegaMoeTilingData& tiling, int64_t m, in
         TORCH_CHECK(act_beta_up >= 0.0,
                     "act_betas[1] (beta_up) must be 0 (linear up branch) or positive for activation='situglu'");
     }
-    // SiTU-GLU tanh selection (forward AND backward epilogues): the packaged
-    // high-level Tanh (hardware INTRINSIC algorithm on 950PR/DT) is the
-    // DEFAULT — at the K3-class bench shape it cut the fwd+bwd step by ~18%
-    // (fwd -4.1ms, bwd -4.7ms) with the precision gate green. The per-op BF16
-    // rounding chain is unchanged; only the FP32-internal tanh differs
-    // (<= 1 ulp). MEGAMOE_ACT_TANH=0 opts back into the original register
-    // exp-identity formula (kept as a fallback and for A/B attribution).
+    // SiTU-GLU tanh selection (forward AND backward epilogues): the default
+    // is the register exp-identity formula; the packaged high-level Tanh
+    // (hardware INTRINSIC algorithm on 950PR/DT, <= 1 ulp FP32-internal
+    // difference) is OPT-IN via MEGAMOE_ACT_TANH=1/true/on/yes. On the source
+    // repo the packaged path cut the K3-class fwd+bwd step by ~18% after a
+    // green gate; enable it here only after this repo's own device A/B.
     // The saved-MXFP8 combination always runs the formula path (kernel-side
     // guard: the quant epilogue owns the UB beyond the work tiles).
     if (activationKind == kMegaMoeActivationSituGlu) {
-        activationKind |= kMegaMoeActivationTanhPackagedBit;
         const char* tanhMode = std::getenv("MEGAMOE_ACT_TANH");
-        if (tanhMode != nullptr) {
+        if (tanhMode != nullptr && tanhMode[0] != '\0') {
             const std::string mode(tanhMode);
-            if (mode == "0" || mode == "false" || mode == "off") {
-                activationKind &= ~kMegaMoeActivationTanhPackagedBit;
+            if (mode == "1" || mode == "true" || mode == "on" || mode == "yes") {
+                activationKind |= kMegaMoeActivationTanhPackagedBit;
             } else {
-                TORCH_CHECK(mode == "1" || mode == "true" || mode == "on" || mode == "yes" || mode.empty(),
+                TORCH_CHECK(mode == "0" || mode == "false" || mode == "off",
                             "MEGAMOE_ACT_TANH must be 1/true/on/yes or 0/false/off, got '", mode, "'");
             }
         }

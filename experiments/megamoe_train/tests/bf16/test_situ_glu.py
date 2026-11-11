@@ -327,5 +327,31 @@ class BridgeActivationThreadingTests(unittest.TestCase):
         self.assertEqual(op._executor.backward_args[-3:], ("swiglu", 4.0, 25.0))
 
 
+@unittest.skipIf(torch is None, "CPU Torch is required; no NPU or ATK is needed")
+class BaselineDispatcherCallForms(unittest.TestCase):
+    """npu_baseline._activation_pair helpers must accept run_baseline's exact
+    call forms for BOTH families (regression: _swiglu_fp32 once rejected the
+    act_betas kwarg and crashed every swiglu precision case)."""
+
+    def test_both_families_accept_run_baseline_call_forms(self):
+        from npu_baseline import _activation_pair
+
+        z = torch.tensor([[0.5, -1.0, 2.0, 0.3] * 4], dtype=torch.bfloat16)  # 2F width
+        raw = z.clone()
+        grad_h = torch.tensor([[0.1, -0.2, 0.05, 0.15] * 2], dtype=torch.float32)  # F width
+        for activation in ("swiglu", "situglu"):
+            act_forward, act_backward = _activation_pair(activation)
+            h1 = act_forward(z, 0.0, act_betas=(4.0, 25.0))
+            h2 = act_forward(z, 0.0, raw, act_betas=(4.0, 25.0))
+            dz = act_backward(grad_h, z, 0.0, raw, act_betas=(4.0, 25.0))
+            dz2 = act_backward(grad_h, z, 0.0, None, act_betas=(4.0, 0.0))
+            self.assertEqual(h1.shape[-1], z.shape[-1] // 2)
+            self.assertEqual(h2.shape[-1], z.shape[-1] // 2)
+            self.assertEqual(dz.shape[-1], z.shape[-1])
+            self.assertEqual(dz2.shape[-1], z.shape[-1])
+            for value in (h1, h2, dz, dz2):
+                self.assertTrue(torch.isfinite(value.float()).all())
+
+
 if __name__ == "__main__":
     unittest.main()

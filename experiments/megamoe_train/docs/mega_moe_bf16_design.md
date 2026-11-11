@@ -109,17 +109,20 @@ A(g) = β₁·tanh(g/β₁)·σ(g);  B(u) = β₂·tanh(u/β₂)  (β₂=0 即�
 H    = A·B                                          # |H| <= β₁·β₂ (K3 默认 4×25=100)
 ```
 
-SiTU-GLU 的数值约定与 SwiGLU 不同：激活内部不是"FP32 直通、末端一次舍入"，而是复现 eager 参考图的**逐算子 BF16 物化链**——每个中间量在 FP32 计算后舍入到 BF16 再读回（记 R）：
+SiTU-GLU 的数值约定与本仓 SwiGLU 完全一致（FP32 直通、单次舍入），仅公式不同：
 
 ```text
-前向:  d1=R(g/β₁) t1=R(tanh d1) a1=R(β₁·t1) sg=R(σ(g)) A=R(a1·sg)
-       e1=R(u/β₂) t2=R(tanh e1) B=R(β₂·t2)  H=R(A·B)   Hp=R(H·p)
-反向:  前向链全部按 R 重算; dA=R(G·B), dB=R(G·A) (G=FP32(dHp)·p32, 与 SwiGLU 同一边界)
-       dUp   = R(R(R(dB·β₂)·(1−t2²))/β₂)
-       dGate = R( R(R(dA·sg)·sg·(1−sg)) + R(R(R(R(dA·sg)·β₁)·(1−t1²))/β₁) )
+A(g) = β₁·tanh_FP32(g/β₁)·σ_FP32(g)   # FP32，不插入 BF16 舍入
+B(u) = β₂·tanh_FP32(u/β₂)             # β₂=0 即参考实现的 linear_beta: B(u)=u
+H    = A·B                            # FP32
+Hp   = Rbf16(H · p32)                 # 前向唯一舍入的激活量
+G    = FP32(dHp) · p32                # 与 SwiGLU 相同的 dH 边界
+dUp   = Rbf16(G · B · A · (1 − tanh₂²))     # 线性 up 分支: Rbf16(G · A)
+dGate = Rbf16(G · B · ((1−t₁²)·σ + β₁·t₁·σ·(1−σ)))
+dp32  = sum_FP32(FP32(dHp) · H)
 ```
 
-跳过链上任何一个 R 点，前向宽松门能过、反向精度门会失败（与 SwiGLU 的 silu 物化同理，但链更长）。tanh 有两条等价实现：寄存器恒等式 `tanh(x)=1−2/(1+exp(2x))`（纯 Reg 原语），以及封装高层 `AscendC::Tanh`（950PR/DT 硬件 tanh 指令，Host 默认启用）。两者仅 FP32 内部相差 ≤1 ulp，链上的 R 点逐点一致。MXFP8 保存模式下封装 Tanh 不参与（量化 epilogue 占用其 UB 暂存区），自动使用公式路径；SiTU-GLU 无裁剪掩码，MXFP8 解码不施加哨兵恢复。
+tanh 有两条等价实现：寄存器恒等式 `tanh(x)=1−2/(1+exp(2x))`（纯 Reg 原语，默认），以及封装高层 `AscendC::Tanh`（950PR/DT 硬件 tanh 指令，`MEGAMOE_ACT_TANH=1` 显式启用）。两者仅 FP32 内部相差 ≤1 ulp。MXFP8 保存模式下封装 Tanh 不参与（量化 epilogue 占用其 UB 暂存区），自动使用公式路径；SiTU-GLU 无裁剪掩码，MXFP8 解码不施加哨兵恢复。
 
 ## 2. 架构设计
 
@@ -431,8 +434,8 @@ MXFP8 的 clipping mask 保留前向裁剪判定，反向不能仅根据解码�
 SiTU-GLU 在 epilogue 中以独立的函数族实现，与 SwiGLU 共用工作 tile 和 GM 布局：
 
 - 前向 epilogue 按 tiling 的 `activationKind` 分派 `ComputeSituGluDirect`（公式）或 `ComputeSituGluTanhOpDirect`（封装 Tanh）；两者都直接产出 `Hp`，权重乘位于链上最后一个 R 点之后，保持"先物化 H、再乘 p"的顺序。
-- 反向尾块分步路径按同一分派选择 `ComputeForwardAuxSitu(±TanhOp)` 与 `ComputeSituGluGrad(±TanhOp)`/`ComputeSituGluRecompute(±TanhOp)`；它们沿用 SwiGLU 尾块的 I/O 契约（p 在 FP32 内乘入、BF16 Hp 写入 up tile、FP32 行部分和复用 gate tile），仅把激活公式替换为上述 R 链。
-- SwiGLU 的满 tile 融合路径 `ComputeFusedFullTile` 不提供 situ 变体：situ 一律走尾块分步路径（与封装 Tanh 变体经过设备验证的结构一致）。封装 Tanh 的三个暂存缓冲与 8 KiB tmp 复用 MXFP8 解码区底部，由"savedGateUpMode != mxfp8"守卫互斥。
+- 反向尾块分步路径按同一分派选择 `ComputeForwardAuxSitu(±TanhOp)` 与 `ComputeSituGluGrad(±TanhOp)`/`ComputeSituGluRecompute(±TanhOp)`；它们沿用 SwiGLU 尾块的 I/O 契约（p 在 FP32 内乘入、BF16 Hp 写入 up tile、FP32 行部分和复用 gate tile），仅把激活公式替换为上述 FP32 softcap 组合，舍入边界与 SwiGLU 逐位对齐。
+- SwiGLU 的满 tile 融合路径 `ComputeFusedFullTile` 不提供 situ 变体：situ 一律走尾块分步路径。封装 Tanh 变体保留在代码树中，由 `MEGAMOE_ACT_TANH=1` 显式启用；其三个暂存缓冲与 8 KiB tmp 复用 MXFP8 解码区底部，由"savedGateUpMode != mxfp8"守卫互斥。
 - 分派点必须位于 `__VEC_SCOPE__` 之外：向量化作用域内围绕高层 API 调用的运行时分支会被编译器静默折叠到 else 侧；且高层 Tanh 调用必须保持在 repeat 层（两级循环内），part 层嵌套会触发后端崩溃。
 
 ### 3.7 前后向 dispatch 就绪与同步协议

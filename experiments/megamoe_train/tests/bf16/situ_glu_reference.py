@@ -10,12 +10,13 @@ Definitions (matching kernels/mega_moe_bf16 epilogues):
     A'(g) = (1 - t1^2) * sig + beta_gate * t1 * sig * (1 - sig)
             with t1 = tanh(g / beta_gate), sig = sigmoid(g)
 
-Rounding conventions mirror the eager reference graph (BigOp golden /
-torch eager small-op graph): every elementwise op materializes BF16, so
-the forward and backward goldens below apply one BF16 rounding per op
-(see situ_glu_forward / situ_glu_grad). The FP32 helpers (situ_gate_act /
-situ_up_act / situ_gate_grad / situ_up_grad) keep the unrounded formulas
-for derivative checks.
+Rounding conventions: the FP32 helpers (situ_gate_act / situ_up_act /
+situ_gate_grad / situ_up_grad) are the unrounded formulas; they match this
+repo's kernel and precision references (cpu_reference.py FP64,
+npu_baseline.py FP32), which use the FP32-through single-rounding
+convention. The chain goldens (situ_glu_forward / situ_glu_grad) apply one
+BF16 rounding per op -- the SOURCE repo's kernel convention, kept here as
+math regression for both conventions.
 
 All inputs are float32 numpy arrays; outputs are float32 with BF16 values
 (representable exactly).

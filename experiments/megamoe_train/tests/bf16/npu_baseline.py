@@ -91,7 +91,9 @@ def _activation_operands(gate_up, limit, raw=None):
     return gate, up, gate_mask, up_mask
 
 
-def _swiglu_fp32(gate_up, limit, raw=None):
+def _swiglu_fp32(gate_up, limit, raw=None, act_betas=(4.0, 25.0)):
+    """SwiGLU forward in FP32; ``act_betas`` is accepted and ignored so the
+    activation-family dispatcher can call every helper with one signature."""
     gate, up, _, _ = _activation_operands(gate_up, limit, raw)
     silu = gate / (1.0 + torch.exp(-gate))
     return silu * up
@@ -114,26 +116,33 @@ def _situ_fp32(gate_up, limit, raw=None, act_betas=(4.0, 25.0)):
 def _situ_backward_fp32(grad_h, gate_up, limit, raw=None, act_betas=(4.0, 25.0)):
     """SiTU-GLU derivative in FP32; only dGate/dUp are BF16 outputs.
 
-    dGate = dA * A'(g) with A'(g) = (1 - t1^2)*sig + beta_gate*t1*sig*(1 - sig);
-    dUp = dA * A(g) * B'(u) with B'(u) = 1 - tanh(u/beta_up)^2 (linear up: 1).
+    dGate = G * B * A'(g) with A'(g) = (1 - t1^2)*sig + beta_gate*t1*sig*(1 - sig);
+    dUp = G * B * A(g) * B'(u) with B'(u) = 1 - tanh(u/beta_up)^2. The linear-up
+    branch keeps B(u) = u, so dUp = G * A(g) directly.
     """
     gate, up, _, _ = _activation_operands(gate_up, limit, raw)
     beta_gate, beta_up = (float(value) for value in act_betas)
     t1 = torch.tanh(gate / beta_gate)
     sigmoid = 1.0 / (1.0 + torch.exp(-gate))
     gate_act = beta_gate * t1 * sigmoid
-    da = grad_h.float() * (up if beta_up == 0 else beta_up * torch.tanh(up / beta_up))
-    dg = da * ((1.0 - t1 * t1) * sigmoid + beta_gate * t1 * sigmoid * (1.0 - sigmoid))
+    grad_h = grad_h.float()
     if beta_up == 0:
-        du = da
+        da = grad_h * up
+        dg = da * ((1.0 - t1 * t1) * sigmoid + beta_gate * t1 * sigmoid * (1.0 - sigmoid))
+        du = grad_h * gate_act
     else:
+        da = grad_h * (beta_up * torch.tanh(up / beta_up))
+        dg = da * ((1.0 - t1 * t1) * sigmoid + beta_gate * t1 * sigmoid * (1.0 - sigmoid))
         t2 = torch.tanh(up / beta_up)
         du = da * gate_act * (1.0 - t2 * t2)
     return torch.cat((dg, du), dim=-1).to(gate_up.dtype)
 
 
-def _swiglu_backward_fp32(grad_h, gate_up, limit, raw=None):
-    """Keep dH and the derivative in FP32; only dGate/dUp are BF16 outputs."""
+def _swiglu_backward_fp32(grad_h, gate_up, limit, raw=None, act_betas=(4.0, 25.0)):
+    """Keep dH and the derivative in FP32; only dGate/dUp are BF16 outputs.
+
+    ``act_betas`` is accepted and ignored for dispatcher signature parity.
+    """
     gate, up, gate_mask, up_mask = _activation_operands(gate_up, limit, raw)
     denominator = 1.0 + torch.exp(-gate)
     silu = gate / denominator
