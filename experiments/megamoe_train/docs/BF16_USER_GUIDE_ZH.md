@@ -130,6 +130,8 @@ Tensor 输入必须 contiguous，全部位于构造时选定的同一 NPU。也�
 
 SiTU-GLU 的数值约定与 swiglu 一致（激活 FP32 直通、`Hp` 单次舍入、梯度同边界），只是公式换成 softcap 组合。tanh 默认用寄存器 exp 恒等式实现；`MEGAMOE_ACT_TANH=1` 可显式启用封装的高层 `AscendC::Tanh`（950PR/DT 硬件 tanh 指令，仅 FP32 内部相差 ≤1 ulp；在该仓完成设备 A/B 前保持默认关闭）。saved MXFP8 与封装 Tanh 的组合自动回退到公式路径（量化 epilogue 拥有工作 tile 之外的 UB）。数值边界与内核实现见[设计文档](mega_moe_bf16_design.md)；设备验收用 `test_mega_moe.py --suite situ`。
 
+SiTU-GLU 反向满 tile epilogue 默认走分步路径（aux → 存 Hp/dp → 重载 Gate/Up → grad）；`MEGAMOE_SITU_FUSED=1` 可切换为单遍融合实现（`ComputeFusedFullTileSitu`：Gate/Up 只读一次，h、dp、Hp 与梯度在寄存器内一遍完成，逐操作顺序复刻分步路径，各 Tanh 模式与其分步基线逐位一致）。默认关闭；saved MXFP8 与封装 Tanh 的互斥约束与分步路径相同。背景、实现边界与验收清单见 [mega_moe_situ_fulltile_design.md](mega_moe_situ_fulltile_design.md)。
+
 ### 3.3 自动求导与保存模式
 
 `loss.backward()` 自动计算 x、topk_weights、w1、w2 的梯度；对应模型参数需保留 requires_grad 及梯度连接。`dx/dw1/dw2` 为 BF16，`dtopk_weights` 跟随本次 p 的 BF16 或 FP32 类型。FP32 p 在搬运和激活计算前不降为 BF16；dp 乘积及部分和始终 FP32，仅 BF16 返回分支在末端舍入。算子本身不注册专家参数，优化器应管理模型的 router 和专家 `nn.Parameter`。

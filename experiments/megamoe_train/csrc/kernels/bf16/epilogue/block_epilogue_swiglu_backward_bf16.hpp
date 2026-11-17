@@ -170,12 +170,29 @@ public:
         LoadGateUpTiles(rowBase_ + mLoc, nLoc, singleM, singleN, l0cOutUbSecond_, extraA_);
 
         // Full 128x256 tiles consume this Gate/Up load without a second GM read.
-        // SiTU-GLU keeps the staged aux -> store -> reload -> grad structure:
-        // its per-op BF16 chain and the packaged-Tanh variants were validated
-        // in that shape, and the fused path is a SwiGLU-only optimization.
+        // SwiGLU always takes the fused path. SiTU-GLU takes the single-pass
+        // fused variant when opted in (kMegaMoeActivationSituFusedBit,
+        // docs/mega_moe_situ_fulltile_design.md); otherwise it keeps the
+        // validated staged aux -> store -> reload -> grad structure, as do
+        // the tail tiles of both activations.
         const bool situActivation = (params_.activationKind & kMegaMoeActivationKindMask) == kMegaMoeActivationSituGlu;
-        if (!situActivation && singleM == kTileRows && singleN == kTileColumns && rowStrideInPlane == singleN) {
+        const bool fullTile = singleM == kTileRows && singleN == kTileColumns && rowStrideInPlane == singleN;
+        if (fullTile && !situActivation) {
             RunFusedFullTile(singleM, singleN, mLoc, nLoc);
+            return;
+        }
+        if (fullTile && situActivation && (params_.activationKind & kMegaMoeActivationSituFusedBit) != 0) {
+            // Dispatch the packaged-Tanh branch BEFORE entering __VEC_SCOPE__:
+            // a runtime branch inside the vector scope whose taken side calls
+            // a high-level API never engaged on bisheng. The packaged variant
+            // never engages when savedGateUpMode is kSaveMxFp8, mirroring the
+            // stepwise dispatchers.
+            if ((params_.activationKind & kMegaMoeActivationTanhPackagedBit) != 0 &&
+                params_.savedGateUpMode != MegaMoeBF16Training::kSaveMxFp8) {
+                RunFusedFullTileSitu<true>(singleM, singleN, mLoc, nLoc);
+            } else {
+                RunFusedFullTileSitu<false>(singleM, singleN, mLoc, nLoc);
+            }
             return;
         }
         ComputeForwardAux(singleM, singleN, rowStrideInPlane);
@@ -1330,6 +1347,307 @@ private:
         } else {
             ComputeFusedFullTile<false>();
         }
+        AscendC::SyncFunc<AscendC::HardEvent::V_MTE2>();
+        AscendC::SyncFunc<AscendC::HardEvent::V_MTE3>();
+        AscendC::DataCopyExtParams partialCopy{static_cast<uint16_t>(rows), sizeof(float), 0U,
+                                               static_cast<uint32_t>((dpPartialTiles_ - 1) * sizeof(float)), 0U};
+        AscendC::DataCopyPad(dpPartialsGm_[(rowBase_ + mLoc) * dpPartialTiles_ + nLoc / BACKWARD_DP_PARTIAL_TILE_N],
+                             fusedDpUb_, partialCopy);
+        AscendC::DataCopyExtParams hpCopy{static_cast<uint16_t>(rows),
+                                          static_cast<uint32_t>(columns * sizeof(bfloat16_t)), 0U,
+                                          static_cast<uint32_t>((outputF_ - columns) * sizeof(bfloat16_t)), 0U};
+        AscendC::DataCopyPad(hpGm_[(rowBase_ + mLoc) * outputF_ + nLoc], extraA_, hpCopy);
+        AscendC::DataCopyExtParams gradCopy{static_cast<uint16_t>(rows),
+                                            static_cast<uint32_t>(columns * sizeof(bfloat16_t)), 0U,
+                                            static_cast<uint32_t>((outputN_ - columns) * sizeof(bfloat16_t)), 0U};
+        AscendC::DataCopyPad(gradZGm_[(rowBase_ + mLoc) * outputN_ + nLoc], l0cOutUbFirst_, gradCopy);
+        AscendC::DataCopyPad(gradZGm_[(rowBase_ + mLoc) * outputN_ + outputF_ + nLoc], l0cOutUbSecond_, gradCopy);
+        AscendC::SyncFunc<AscendC::HardEvent::MTE3_MTE2>();
+        AscendC::SyncFunc<AscendC::HardEvent::MTE3_V>();
+    }
+
+    // SiTU-GLU single-pass fused full tile (docs/mega_moe_situ_fulltile_design.md).
+    // Same UB residency and in-place store aliases as ComputeFusedFullTile:
+    // dHp enters the first tile, one Gate/Up load fills the second and third
+    // tiles, and the register loop emits dp partials, Hp, dUp and dGate with
+    // no stepwise aux -> store -> reload -> grad round trips. Per element the
+    // FP32 op order replicates the stepwise functions bitwise -- h/dp/Hp
+    // follow ComputeForwardAuxSitu (or ComputeForwardAuxSituTanhOp) and
+    // dUp/dGate follow ComputeSituGluGrad (or ComputeSituGluGradTanhOp), so
+    // each Tanh mode stays bitwise-identical to its own stepwise baseline.
+    // SiTU-GLU never clips, so no clip-mask variant exists.  The packaged-
+    // Tanh variant stages its divided Tanh inputs through the repeat-wide
+    // scratch (never engaged when savedGateUpMode is kSaveMxFp8, guarded at
+    // the dispatch site).
+    template <bool UseTanhPackaged>
+    __aicore__ inline void ComputeFusedFullTileSitu()
+    {
+        constexpr float kOne = 1.0F;
+        constexpr float kTwo = 2.0F;
+        constexpr float kNegOne = -1.0F;
+        const float betaGate = params_.actBetaGate;
+        const float betaUp = params_.actBetaUp;
+        const bool linearUp = betaUp == 0.0F;
+        auto* dGate = (__ubuf__ bfloat16_t*)l0cOutUbFirst_.GetPhyAddr();
+        auto* dUp = (__ubuf__ bfloat16_t*)l0cOutUbSecond_.GetPhyAddr();
+        auto* hp = (__ubuf__ bfloat16_t*)extraA_.GetPhyAddr();
+        auto* weights = (__ubuf__ TopkWeightT*)packedWeightUb_.GetPhyAddr();
+        auto* partials = (__ubuf__ float*)fusedDpUb_.GetPhyAddr();
+        __ubuf__ float* tanhIn = (__ubuf__ float*)situTanhIn_.GetPhyAddr();
+        __ubuf__ float* tanhGateOut = (__ubuf__ float*)situTanhGateOut_.GetPhyAddr();
+        __ubuf__ float* tanhUpOut = (__ubuf__ float*)situTanhUpOut_.GetPhyAddr();
+        constexpr uint16_t rows = kTileRows, columns = kTileColumns;
+        __VEC_SCOPE__
+        {
+            for (uint16_t row = 0; row < rows; ++row) {
+                auto oneLane = AscendC::Reg::CreateMask<float, AscendC::Reg::MaskPattern::VL1>();
+                AscendC::Reg::RegTensor<float> accumulated, pFp;
+                AscendC::Reg::RegTensor<bfloat16_t> pBf;
+                AscendC::Reg::Duplicate(accumulated, 0.0F, oneLane);
+                if constexpr (std::is_same_v<TopkWeightT, bfloat16_t>) {
+                    AscendC::Reg::DataCopy<bfloat16_t, AscendC::Reg::LoadDist::DIST_BRC_B16>(pBf, weights + row);
+                    auto all = AscendC::Reg::CreateMask<float, AscendC::Reg::MaskPattern::ALL>();
+                    AscendC::Reg::Cast<float, bfloat16_t, kBackwardCastBF16ToFP32>(pFp, pBf, all);
+                } else {
+                    AscendC::Reg::DataCopy<float, AscendC::Reg::LoadDist::DIST_BRC_B32>(pFp, weights + row);
+                }
+                if constexpr (UseTanhPackaged) {
+                    // Mirror ComputeForwardAuxSituTanhOp + ComputeSituGluGradTanhOp:
+                    // per 128-BF16 repeat both tanh calls run at REPEAT level
+                    // through the staged UB scratch, then each 64-lane part
+                    // finishes H, dp, Hp and the gradient chain in FP32.
+                    constexpr uint16_t kElementsPerRepeat = 256U / sizeof(bfloat16_t);
+                    constexpr uint16_t kParts = sizeof(float) / sizeof(bfloat16_t);
+                    constexpr uint16_t kPartSize = kElementsPerRepeat / kParts;
+                    const uint16_t repeatsPerRow = static_cast<uint16_t>(
+                        Ops::Base::CeilDiv(static_cast<uint64_t>(columns), static_cast<uint64_t>(kElementsPerRepeat)));
+                    AscendC::Reg::RegTensor<float> oneReg, betaGateReg, betaUpReg;
+                    for (uint16_t repeat = 0; repeat < repeatsPerRow; ++repeat) {
+                        uint32_t remaining = columns - repeat * kElementsPerRepeat;
+                        AscendC::Reg::MaskReg mask = AscendC::Reg::UpdateMask<bfloat16_t>(remaining);
+                        AscendC::Reg::Duplicate(oneReg, kOne, mask);
+                        AscendC::Reg::Muls(betaGateReg, oneReg, betaGate, mask);
+                        AscendC::Reg::Muls(betaUpReg, oneReg, betaUp, mask);
+                        AscendC::Reg::RegTensor<bfloat16_t> dH0, dH1, g0, g1, u0, u1;
+                        AscendC::Reg::RegTensor<float> dHFp0, dHFp1, gf0, gf1, uf0, uf1;
+                        const uint32_t offset =
+                            static_cast<uint32_t>(row) * kTileColumns + repeat * kElementsPerRepeat;
+                        AscendC::Reg::DataCopy(dH0, dGate + offset);
+                        AscendC::Reg::DataCopy(g0, dUp + offset);
+                        AscendC::Reg::DataCopy(u0, hp + offset);
+                        AscendC::Reg::Interleave(dH0, dH1, dH0, dH1);
+                        AscendC::Reg::Interleave(g0, g1, g0, g1);
+                        AscendC::Reg::Interleave(u0, u1, u0, u1);
+                        AscendC::Reg::Cast<float, bfloat16_t, kBackwardCastBF16ToFP32>(dHFp0, dH0, mask);
+                        AscendC::Reg::Cast<float, bfloat16_t, kBackwardCastBF16ToFP32>(dHFp1, dH1, mask);
+                        AscendC::Reg::Cast<float, bfloat16_t, kBackwardCastBF16ToFP32>(gf0, g0, mask);
+                        AscendC::Reg::Cast<float, bfloat16_t, kBackwardCastBF16ToFP32>(gf1, g1, mask);
+                        AscendC::Reg::Cast<float, bfloat16_t, kBackwardCastBF16ToFP32>(uf0, u0, mask);
+                        AscendC::Reg::Cast<float, bfloat16_t, kBackwardCastBF16ToFP32>(uf1, u1, mask);
+                        // stage 1: d1 = g / betaGate -> tanh src buffer
+                        for (uint16_t part = 0; part < kParts; ++part) {
+                            auto g = part == 0 ? gf0 : gf1;
+                            AscendC::Reg::RegTensor<float> d;
+                            AscendC::Reg::Div<float, &kBackwardDivMode>(d, g, betaGateReg, mask);
+                            AscendC::Reg::DataCopy(tanhIn + part * kPartSize, d, mask);
+                        }
+                        AscendC::Reg::LocalMemBar<AscendC::Reg::MemType::VEC_STORE, AscendC::Reg::MemType::VEC_LOAD>();
+                        AscendC::Tanh(situTanhGateOut_, situTanhIn_, situTanhTmp_, kElementsPerRepeat);
+                        AscendC::Reg::LocalMemBar<AscendC::Reg::MemType::VEC_STORE, AscendC::Reg::MemType::VEC_LOAD>();
+                        // stage 2 (skipped for linearUp): e1 = u / betaUp
+                        if (!linearUp) {
+                            for (uint16_t part = 0; part < kParts; ++part) {
+                                auto u = part == 0 ? uf0 : uf1;
+                                AscendC::Reg::RegTensor<float> d;
+                                AscendC::Reg::Div<float, &kBackwardDivMode>(d, u, betaUpReg, mask);
+                                AscendC::Reg::DataCopy(tanhIn + part * kPartSize, d, mask);
+                            }
+                            AscendC::Reg::LocalMemBar<AscendC::Reg::MemType::VEC_STORE,
+                                                      AscendC::Reg::MemType::VEC_LOAD>();
+                            AscendC::Tanh(situTanhUpOut_, situTanhIn_, situTanhTmp_, kElementsPerRepeat);
+                            AscendC::Reg::LocalMemBar<AscendC::Reg::MemType::VEC_STORE,
+                                                      AscendC::Reg::MemType::VEC_LOAD>();
+                        }
+                        // stage 3: reload t1/t2 and finish H, dp, Hp and the
+                        // FP32 derivative per part.
+                        for (uint16_t part = 0; part < kParts; ++part) {
+                            auto g = part == 0 ? gf0 : gf1;
+                            auto u = part == 0 ? uf0 : uf1;
+                            auto dHFp = part == 0 ? dHFp0 : dHFp1;
+                            AscendC::Reg::RegTensor<float> gout, t1, t2, a, b, sg, arg, ex, den;
+                            AscendC::Reg::RegTensor<float> hFp, hpFp, productFp, rowSum;
+                            AscendC::Reg::RegTensor<float> dUpFp, dGateFp, oneMinusT, inner, term;
+                            AscendC::Reg::RegTensor<bfloat16_t> hpBf, dUpOut, dGateOut;
+                            AscendC::Reg::Mul(gout, dHFp, pFp, mask);
+                            // t1 = tanh(d1); sg = sigmoid(g); A = betaGate*t1*sg
+                            AscendC::Reg::DataCopy(t1, tanhGateOut + part * kPartSize);
+                            AscendC::Reg::Muls(arg, g, kNegOne, mask);
+                            AscendC::Reg::Exp(ex, arg, mask);
+                            AscendC::Reg::Adds(den, ex, kOne, mask);
+                            AscendC::Reg::Div<float, &kBackwardDivMode>(sg, oneReg, den, mask);
+                            AscendC::Reg::Muls(a, t1, betaGate, mask);
+                            AscendC::Reg::Mul(a, a, sg, mask);
+                            if (linearUp) {
+                                AscendC::Reg::Mul(hFp, a, u, mask);            // H = A * u
+                            } else {
+                                AscendC::Reg::DataCopy(t2, tanhUpOut + part * kPartSize);
+                                AscendC::Reg::Muls(b, t2, betaUp, mask);       // B = betaUp*t2
+                                AscendC::Reg::Mul(hFp, a, b, mask);            // H = A * B
+                            }
+                            // dp partials consume the FP32 H; Hp = R(H * p) rounds once.
+                            AscendC::Reg::Mul(productFp, dHFp, hFp, mask);
+                            AscendC::Reg::ReduceSum(rowSum, productFp, mask);
+                            AscendC::Reg::Add(accumulated, accumulated, rowSum, oneLane);
+                            AscendC::Reg::Mul(hpFp, hFp, pFp, mask);
+                            AscendC::Reg::Cast<bfloat16_t, float, kBackwardCastFP32ToBF16>(hpBf, hpFp, mask);
+                            AscendC::Reg::DataCopy<bfloat16_t, AscendC::Reg::StoreDist::DIST_PACK_B32>(
+                                hp + offset + part * kPartSize, hpBf, mask);
+                            if (linearUp) {
+                                AscendC::Reg::Mul(dUpFp, gout, a, mask);       // dUp = G * A
+                                AscendC::Reg::Cast<bfloat16_t, float, kBackwardCastFP32ToBF16>(dUpOut, dUpFp, mask);
+                                AscendC::Reg::DataCopy<bfloat16_t, AscendC::Reg::StoreDist::DIST_PACK_B32>(
+                                    dUp + offset + part * kPartSize, dUpOut, mask);
+                                // B(u) = u folds into gout so the gate branch
+                                // receives da = G * u.
+                                AscendC::Reg::Mul(gout, gout, u, mask);
+                            } else {
+                                AscendC::Reg::Mul(dUpFp, gout, b, mask);       // G * B
+                                AscendC::Reg::Mul(dUpFp, dUpFp, a, mask);
+                                AscendC::Reg::Mul(oneMinusT, t2, t2, mask);
+                                AscendC::Reg::Sub(oneMinusT, oneReg, oneMinusT, mask);
+                                AscendC::Reg::Mul(dUpFp, dUpFp, oneMinusT, mask);
+                                AscendC::Reg::Cast<bfloat16_t, float, kBackwardCastFP32ToBF16>(dUpOut, dUpFp, mask);
+                                AscendC::Reg::DataCopy<bfloat16_t, AscendC::Reg::StoreDist::DIST_PACK_B32>(
+                                    dUp + offset + part * kPartSize, dUpOut, mask);
+                                // da = G * B feeds the gate branch below.
+                                AscendC::Reg::Mul(gout, gout, b, mask);
+                            }
+                            // dGate = da * ((1-t1^2)*sg + betaGate*t1*sg*(1-sg))
+                            AscendC::Reg::Mul(oneMinusT, t1, t1, mask);
+                            AscendC::Reg::Sub(oneMinusT, oneReg, oneMinusT, mask);
+                            AscendC::Reg::Mul(inner, oneMinusT, sg, mask);
+                            AscendC::Reg::Sub(dGateFp, oneReg, sg, mask);
+                            AscendC::Reg::Muls(term, t1, betaGate, mask);
+                            AscendC::Reg::Mul(term, term, sg, mask);
+                            AscendC::Reg::Mul(term, term, dGateFp, mask);
+                            AscendC::Reg::Add(inner, inner, term, mask);
+                            AscendC::Reg::Mul(dGateFp, gout, inner, mask);
+                            AscendC::Reg::Cast<bfloat16_t, float, kBackwardCastFP32ToBF16>(dGateOut, dGateFp, mask);
+                            AscendC::Reg::DataCopy<bfloat16_t, AscendC::Reg::StoreDist::DIST_PACK_B32>(
+                                dGate + offset + part * kPartSize, dGateOut, mask);
+                        }
+                    }
+                } else {
+                    // Mirror ComputeForwardAuxSitu + ComputeSituGluGrad: per
+                    // 64-lane chunk in column order the register exp identity
+                    // evaluates both tanh calls once, and the same values feed
+                    // H, dp, Hp and the gradient chain.
+                    auto mask = AscendC::Reg::CreateMask<float, AscendC::Reg::MaskPattern::ALL>();
+                    AscendC::Reg::RegTensor<float> oneReg, twoReg, betaGateReg, betaUpReg;
+                    AscendC::Reg::Duplicate(oneReg, kOne, mask);
+                    AscendC::Reg::Duplicate(twoReg, kTwo, mask);
+                    AscendC::Reg::Duplicate(betaGateReg, betaGate, mask);
+                    AscendC::Reg::Duplicate(betaUpReg, betaUp, mask);
+                    for (uint16_t col = 0; col < columns; col += 64U) {
+                        const uint32_t offset = static_cast<uint32_t>(row) * kTileColumns + col;
+                        AscendC::Reg::RegTensor<bfloat16_t> gBf, uBf, dHpBf;
+                        AscendC::Reg::RegTensor<float> gateFp, upFp, dHpFp;
+                        AscendC::Reg::RegTensor<float> d, arg, ex, den, inv, t1, t2, sg, a, b, hFp;
+                        AscendC::Reg::RegTensor<float> hpFp, productFp, rowSum;
+                        AscendC::Reg::RegTensor<float> gout, dUpFp, dGateFp, oneMinusT, inner, term;
+                        AscendC::Reg::RegTensor<bfloat16_t> hpBf, dUpOut, dGateOut;
+                        AscendC::Reg::DataCopy<bfloat16_t, AscendC::Reg::LoadDist::DIST_UNPACK_B16>(gBf,
+                                                                                                    dUp + offset);
+                        AscendC::Reg::DataCopy<bfloat16_t, AscendC::Reg::LoadDist::DIST_UNPACK_B16>(uBf,
+                                                                                                    hp + offset);
+                        AscendC::Reg::DataCopy<bfloat16_t, AscendC::Reg::LoadDist::DIST_UNPACK_B16>(dHpBf,
+                                                                                                    dGate + offset);
+                        AscendC::Reg::Cast<float, bfloat16_t, kBackwardCastBF16ToFP32>(gateFp, gBf, mask);
+                        AscendC::Reg::Cast<float, bfloat16_t, kBackwardCastBF16ToFP32>(upFp, uBf, mask);
+                        AscendC::Reg::Cast<float, bfloat16_t, kBackwardCastBF16ToFP32>(dHpFp, dHpBf, mask);
+                        // ---- FP32 forward recompute (order of ComputeForwardAuxSitu)
+                        AscendC::Reg::Div<float, &kBackwardDivMode>(d, gateFp, betaGateReg, mask);
+                        AscendC::Reg::Muls(arg, d, kTwo, mask);
+                        AscendC::Reg::Exp(ex, arg, mask);
+                        AscendC::Reg::Adds(den, ex, kOne, mask);
+                        AscendC::Reg::Div<float, &kBackwardDivMode>(inv, twoReg, den, mask);
+                        AscendC::Reg::Sub(t1, oneReg, inv, mask);
+                        AscendC::Reg::Muls(a, t1, betaGate, mask);
+                        AscendC::Reg::Muls(arg, gateFp, kNegOne, mask);
+                        AscendC::Reg::Exp(ex, arg, mask);
+                        AscendC::Reg::Adds(den, ex, kOne, mask);
+                        AscendC::Reg::Div<float, &kBackwardDivMode>(sg, oneReg, den, mask);
+                        AscendC::Reg::Mul(a, a, sg, mask);                 // A = betaGate*t1*sg
+                        // ---- up branch: B = betaUp*tanh(u/betaUp) (linear keeps u)
+                        if (linearUp) {
+                            AscendC::Reg::Mul(hFp, a, upFp, mask);         // H = A * u
+                        } else {
+                            AscendC::Reg::Div<float, &kBackwardDivMode>(d, upFp, betaUpReg, mask);
+                            AscendC::Reg::Muls(arg, d, kTwo, mask);
+                            AscendC::Reg::Exp(ex, arg, mask);
+                            AscendC::Reg::Adds(den, ex, kOne, mask);
+                            AscendC::Reg::Div<float, &kBackwardDivMode>(inv, twoReg, den, mask);
+                            AscendC::Reg::Sub(t2, oneReg, inv, mask);
+                            AscendC::Reg::Muls(b, t2, betaUp, mask);       // B = betaUp*t2
+                            AscendC::Reg::Mul(hFp, a, b, mask);            // H = A * B
+                        }
+                        // dp partials consume the FP32 H; Hp = R(H * p) rounds once.
+                        AscendC::Reg::Mul(productFp, dHpFp, hFp, mask);
+                        AscendC::Reg::ReduceSum(rowSum, productFp, mask);
+                        AscendC::Reg::Add(accumulated, accumulated, rowSum, oneLane);
+                        AscendC::Reg::Mul(hpFp, hFp, pFp, mask);
+                        AscendC::Reg::Cast<bfloat16_t, float, kBackwardCastFP32ToBF16>(hpBf, hpFp, mask);
+                        // ---- gradients (order of ComputeSituGluGrad)
+                        AscendC::Reg::Mul(gout, dHpFp, pFp, mask);
+                        if (linearUp) {
+                            AscendC::Reg::Mul(dUpFp, gout, a, mask);       // dUp = G * A
+                            AscendC::Reg::Cast<bfloat16_t, float, kBackwardCastFP32ToBF16>(dUpOut, dUpFp, mask);
+                            AscendC::Reg::DataCopy<bfloat16_t, AscendC::Reg::StoreDist::DIST_PACK_B32>(
+                                dUp + offset, dUpOut, mask);
+                            // B(u) = u folds into gout so the gate branch
+                            // receives da = G * u.
+                            AscendC::Reg::Mul(gout, gout, upFp, mask);
+                        } else {
+                            AscendC::Reg::Mul(dUpFp, gout, b, mask);       // G * B
+                            AscendC::Reg::Mul(dUpFp, dUpFp, a, mask);
+                            AscendC::Reg::Mul(oneMinusT, t2, t2, mask);
+                            AscendC::Reg::Sub(oneMinusT, oneReg, oneMinusT, mask);
+                            AscendC::Reg::Mul(dUpFp, dUpFp, oneMinusT, mask);
+                            AscendC::Reg::Cast<bfloat16_t, float, kBackwardCastFP32ToBF16>(dUpOut, dUpFp, mask);
+                            AscendC::Reg::DataCopy<bfloat16_t, AscendC::Reg::StoreDist::DIST_PACK_B32>(
+                                dUp + offset, dUpOut, mask);
+                            // da = G * B feeds the gate branch below.
+                            AscendC::Reg::Mul(gout, gout, b, mask);
+                        }
+                        // dGate = da * ((1-t1^2)*sg + betaGate*t1*sg*(1-sg))
+                        AscendC::Reg::Mul(oneMinusT, t1, t1, mask);
+                        AscendC::Reg::Sub(oneMinusT, oneReg, oneMinusT, mask);
+                        AscendC::Reg::Mul(inner, oneMinusT, sg, mask);
+                        AscendC::Reg::Sub(dGateFp, oneReg, sg, mask);
+                        AscendC::Reg::Muls(term, t1, betaGate, mask);
+                        AscendC::Reg::Mul(term, term, sg, mask);
+                        AscendC::Reg::Mul(term, term, dGateFp, mask);
+                        AscendC::Reg::Add(inner, inner, term, mask);
+                        AscendC::Reg::Mul(dGateFp, gout, inner, mask);
+                        AscendC::Reg::Cast<bfloat16_t, float, kBackwardCastFP32ToBF16>(dGateOut, dGateFp, mask);
+                        AscendC::Reg::DataCopy<bfloat16_t, AscendC::Reg::StoreDist::DIST_PACK_B32>(
+                            dGate + offset, dGateOut, mask);
+                        AscendC::Reg::DataCopy<bfloat16_t, AscendC::Reg::StoreDist::DIST_PACK_B32>(
+                            hp + offset, hpBf, mask);
+                    }
+                }
+                // Reduce each row's four 64-element chunks in column order.
+                AscendC::Reg::DataCopy(partials + row * 8U, accumulated, oneLane);
+            }
+        }
+    }
+
+    template <bool UseTanhPackaged>
+    __aicore__ inline void RunFusedFullTileSitu(uint32_t rows, uint32_t columns, uint32_t mLoc, uint32_t nLoc)
+    {
+        static_assert(kMxScratchEnd + kTileRows * 32U <= kWeightOffset,
+                      "Fused partials overlap neither masks nor weights");
+        ComputeFusedFullTileSitu<UseTanhPackaged>();
         AscendC::SyncFunc<AscendC::HardEvent::V_MTE2>();
         AscendC::SyncFunc<AscendC::HardEvent::V_MTE3>();
         AscendC::DataCopyExtParams partialCopy{static_cast<uint16_t>(rows), sizeof(float), 0U,

@@ -115,6 +115,25 @@ MegaMoeHostTiling MakeMegaMoeHostTiling(MegaMoeTilingData& tiling, int64_t m, in
             }
         }
     }
+    // SiTU-GLU backward full-tile fused epilogue (docs/mega_moe_situ_fulltile_design.md):
+    // a single-pass register loop over the resident Gate/Up/dHp work tiles
+    // replacing the stepwise aux -> store Hp/dp -> reload Gate/Up -> grad
+    // structure on every full 128x256 tile. OPT-IN via MEGAMOE_SITU_FUSED;
+    // the default keeps the validated stepwise path. The packaged-Tanh
+    // guard is kernel-side (the fused packaged variant never engages when
+    // savedGateUpMode is kSaveMxFp8, mirroring the stepwise dispatchers).
+    if (activationKind == kMegaMoeActivationSituGlu) {
+        const char* fusedMode = std::getenv("MEGAMOE_SITU_FUSED");
+        if (fusedMode != nullptr && fusedMode[0] != '\0') {
+            const std::string mode(fusedMode);
+            if (mode == "1" || mode == "true" || mode == "on" || mode == "yes") {
+                activationKind |= kMegaMoeActivationSituFusedBit;
+            } else {
+                TORCH_CHECK(mode == "0" || mode == "false" || mode == "off",
+                            "MEGAMOE_SITU_FUSED must be 1/true/on/yes or 0/false/off, got '", mode, "'");
+            }
+        }
+    }
     const float actBetaGate = static_cast<float>(act_beta_gate);
     const float actBetaUp = static_cast<float>(act_beta_up);
     using namespace MegaMoeBF16Training;

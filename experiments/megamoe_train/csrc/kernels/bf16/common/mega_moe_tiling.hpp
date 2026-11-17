@@ -32,14 +32,18 @@ static constexpr float kMegaMoeSwigluLimitDisabled = 3.402823466e+38F;
 // incompatible with the hard clamp (the host rejects the combination).
 constexpr uint8_t kMegaMoeActivationSwiglu = 0;
 constexpr uint8_t kMegaMoeActivationSituGlu = 1;
-// Bit 0 selects the activation family. Higher bits are forward-epilogue
-// variant knobs: the host ORs kMegaMoeActivationTanhPackagedBit in by
-// default to swap the SiTU-GLU tanh from the register exp identity to the
-// packaged high-level Tanh. Family compares must mask with
-// kMegaMoeActivationKindMask; the backward epilogue strips the extra bits
-// when comparing the family.
+// Bit 0 selects the activation family. Higher bits are epilogue variant
+// knobs: the host ORs kMegaMoeActivationTanhPackagedBit in by default to
+// swap the SiTU-GLU tanh from the register exp identity to the packaged
+// high-level Tanh, and kMegaMoeActivationSituFusedBit (opt-in via
+// MEGAMOE_SITU_FUSED) to run the SiTU-GLU backward full-tile epilogue as
+// the single-pass fused variant instead of the stepwise aux -> store ->
+// reload -> grad structure. Family compares must mask with
+// kMegaMoeActivationKindMask; the epilogues strip the extra bits when
+// comparing the family.
 constexpr uint8_t kMegaMoeActivationKindMask = 0x01;
 constexpr uint8_t kMegaMoeActivationTanhPackagedBit = 0x02;
+constexpr uint8_t kMegaMoeActivationSituFusedBit = 0x04;
 // Kimi K3 defaults: beta_gate = 4, beta_up = 25.
 constexpr float kMegaMoeSituBetaGateDefault = 4.0F;
 constexpr float kMegaMoeSituBetaUpDefault = 25.0F;
