@@ -287,6 +287,10 @@ private:
         constexpr float kNegOne = -1.0F;
         const float betaGate = params_.actBetaGate;
         const float betaUp = params_.actBetaUp;
+        // beta divides as reciprocal multiplies (x/beta == x*(1/beta), beta
+        // is a host scalar; ops-nn convention); FP32-internal only.
+        const float recipBetaGate = 1.0F / betaGate;
+        const float recipBetaUp = 1.0F / betaUp;
         // Reference implementation's unspecified linear_beta: beta_up == 0
         // keeps the up branch linear (B(u) = u), capping only the gate.
         const bool linearUp = betaUp == 0.0F;
@@ -318,11 +322,9 @@ private:
                         AscendC::Reg::Cast<float, bfloat16_t, kCastBF16ToFP32>(weightFp, weightBf, all);
                     }
                 }
-                AscendC::Reg::RegTensor<float> oneReg, twoReg, betaGateReg, betaUpReg;
+                AscendC::Reg::RegTensor<float> oneReg, twoReg;
                 AscendC::Reg::Duplicate(oneReg, kOne);
                 AscendC::Reg::Duplicate(twoReg, kTwo);
-                AscendC::Reg::Duplicate(betaGateReg, betaGate);
-                AscendC::Reg::Duplicate(betaUpReg, betaUp);
                 uint32_t remaining = nSize;
                 for (uint16_t col = 0; col < nSize; col += lanes) {
                     auto mask = AscendC::Reg::UpdateMask<float>(remaining);
@@ -334,7 +336,7 @@ private:
                     AscendC::Reg::Cast<float, bfloat16_t, kCastBF16ToFP32>(gf, g, mask);
                     AscendC::Reg::Cast<float, bfloat16_t, kCastBF16ToFP32>(uf, u, mask);
                     // ---- gate branch: A = betaGate * tanh(g/betaGate) * sigmoid(g), FP32
-                    AscendC::Reg::Div<float, &kDivMode>(d, gf, betaGateReg, mask);
+                    AscendC::Reg::Muls(d, gf, recipBetaGate, mask);
                     AscendC::Reg::Muls(arg, d, kTwo, mask);            // tanh identity
                     AscendC::Reg::Exp(ex, arg, mask);
                     AscendC::Reg::Adds(den, ex, kOne, mask);
@@ -350,7 +352,7 @@ private:
                     if (linearUp) {
                         AscendC::Reg::Mul(value, value, uf, mask);
                     } else {
-                        AscendC::Reg::Div<float, &kDivMode>(d, uf, betaUpReg, mask);
+                        AscendC::Reg::Muls(d, uf, recipBetaUp, mask);
                         AscendC::Reg::Muls(arg, d, kTwo, mask);
                         AscendC::Reg::Exp(ex, arg, mask);
                         AscendC::Reg::Adds(den, ex, kOne, mask);
@@ -388,6 +390,10 @@ private:
         constexpr float kNegOne = -1.0F;
         const float betaGate = params_.actBetaGate;
         const float betaUp = params_.actBetaUp;
+        // beta divides as reciprocal multiplies (x/beta == x*(1/beta), beta
+        // is a host scalar; ops-nn convention); FP32-internal only.
+        const float recipBetaGate = 1.0F / betaGate;
+        const float recipBetaUp = 1.0F / betaUp;
         const bool linearUp = betaUp == 0.0F;
         const uint32_t situStride = Ops::Base::CeilAlign(uint32_t(nSize), uint32_t(16));
         __ubuf__ bfloat16_t* first = (__ubuf__ bfloat16_t*)l0cOutUbFirst_.GetPhyAddr();
@@ -423,10 +429,8 @@ private:
                 uint32_t remaining = nSize;
                 for (uint16_t repeat = 0; repeat < repeatsPerRow; ++repeat) {
                     AscendC::Reg::MaskReg mask = AscendC::Reg::UpdateMask<bfloat16_t>(remaining);
-                    AscendC::Reg::RegTensor<float> oneReg, betaGateReg, betaUpReg;
+                    AscendC::Reg::RegTensor<float> oneReg;
                     AscendC::Reg::Duplicate(oneReg, kOne, mask);
-                    AscendC::Reg::Muls(betaGateReg, oneReg, betaGate, mask);
-                    AscendC::Reg::Muls(betaUpReg, oneReg, betaUp, mask);
                     AscendC::Reg::RegTensor<bfloat16_t> gate0, gate1, up0, up1;
                     AscendC::Reg::RegTensor<float> gateFp0, gateFp1, upFp0, upFp1;
                     const uint32_t offset = row * situStride + repeat * kElementsPerRepeat;
@@ -444,7 +448,7 @@ private:
                     for (uint16_t part = 0; part < kParts; ++part) {
                         auto g = part == 0 ? gateFp0 : gateFp1;
                         AscendC::Reg::RegTensor<float> d;
-                        AscendC::Reg::Div<float, &kDivMode>(d, g, betaGateReg, mask);
+                        AscendC::Reg::Muls(d, g, recipBetaGate, mask);
                         AscendC::Reg::DataCopy(tanhIn + part * kPartSize, d, mask);
                     }
                     AscendC::Reg::LocalMemBar<AscendC::Reg::MemType::VEC_STORE, AscendC::Reg::MemType::VEC_LOAD>();
@@ -456,7 +460,7 @@ private:
                         for (uint16_t part = 0; part < kParts; ++part) {
                             auto u = part == 0 ? upFp0 : upFp1;
                             AscendC::Reg::RegTensor<float> d;
-                            AscendC::Reg::Div<float, &kDivMode>(d, u, betaUpReg, mask);
+                            AscendC::Reg::Muls(d, u, recipBetaUp, mask);
                             AscendC::Reg::DataCopy(tanhIn + part * kPartSize, d, mask);
                         }
                         AscendC::Reg::LocalMemBar<AscendC::Reg::MemType::VEC_STORE, AscendC::Reg::MemType::VEC_LOAD>();
