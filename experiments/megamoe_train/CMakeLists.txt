@@ -8,6 +8,15 @@ if(DEEPEP_BF16_FORCE_EXPERT_READY)
 else()
     set(train_force_expert_ready 0)
 endif()
+# Forward dual-AIV GMM1 epilogue: UB path alternates fixpipe targets between
+# the paired AIVs; the GM-decoupled path runs all Dispatch first and splits
+# its tile loop by lane parity. Numerics are bitwise unchanged.
+option(DEEPEP_BF16_GMM1_DUAL_AIV "Forward GMM1 epilogue on both paired AIVs" ON)
+if(DEEPEP_BF16_GMM1_DUAL_AIV)
+    set(train_gmm1_dual_aiv 1)
+else()
+    set(train_gmm1_dual_aiv 0)
+endif()
 find_program(TRAIN_BISHENG bisheng PATHS "${ASCEND_HOME_PATH}/tools/bisheng_compiler/bin" NO_DEFAULT_PATH REQUIRED)
 execute_process(COMMAND "${Python_EXECUTABLE}" -c
     "import torch,torch_npu; from pathlib import Path; print(torch.utils.cmake_prefix_path); print(Path(torch_npu.__file__).parent)"
@@ -42,6 +51,7 @@ set(train_device_flags -O2 -std=c++17 -fPIC -xasc --npu-arch=dav-3510
     --cce-auto-infer-kernel-type=false -Xhost-start -ftrapv -D__ASC_NPU_HOST__ -Xhost-end
     -DCATLASS_ARCH=3510 -DL2_CACHE_HINT
     -DDEEPEP_BF16_FORCE_EXPERT_READY=${train_force_expert_ready}
+    -DDEEPEP_BF16_GMM1_DUAL_AIV=${train_gmm1_dual_aiv}
     -DDEEPEP_BF16_SWIGLU_DECOUPLE=2)
 foreach(path IN LISTS train_include)
     list(APPEND train_device_flags "-I${path}")

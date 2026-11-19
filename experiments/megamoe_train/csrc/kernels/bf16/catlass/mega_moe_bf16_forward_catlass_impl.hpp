@@ -198,13 +198,67 @@ struct ForwardGmTileCopy
                                                              Catlass::Gemm::Tile::ScaleGranularity::NO_QUANT, false>;
 };
 
-template <uint32_t GmmIndex, bool TransW = true, bool GmOutput = false>
+// Dual-AIV forward GMM1 fixpipe: identical tile body to the single-target
+// copier, but the destination tensor's logical base row selects the paired
+// AIV (row < GMM1_TILE_M -> AIV0, else AIV1); both resolve to physical UB
+// offset zero. Same encoding as the backward P1 CopyL0CToDualAivUBTla,
+// applied to BOTH gate and up tiles of a block so a whole block lands on
+// one AIV.
+template <class TensorSrc, class TensorDst>
+struct CopyL0CToDualAivUBFwdTla {
+    using ElementDst = typename TensorDst::Element;
+    using ElementSrc = typename TensorSrc::Element;
+    static constexpr auto quantPre =
+        Catlass::Gemm::Tile::CopyL0CToDstQuantMode<ArchTag, ElementSrc, ElementDst,
+                                                   Catlass::Gemm::Tile::ScaleGranularity::NO_QUANT>::VALUE;
+
+    template <class DstTensor, class SrcTensor>
+    CATLASS_DEVICE void operator()(DstTensor const& dstTensor, SrcTensor const& srcTensor, uint8_t unitFlag = 0) {
+        AscendC::FixpipeParamsC310<AscendC::CO2Layout::ROW_MAJOR> intriParams;
+        intriParams.nSize = tla::get<1>(dstTensor.originShape());
+        intriParams.mSize = tla::get<0>(dstTensor.originShape());
+        intriParams.srcStride = tla::get<1, 1>(srcTensor.stride()) / tla::get<0, 0>(srcTensor.stride());
+        intriParams.dstStride = tla::get<0>(dstTensor.stride());
+        intriParams.quantPre = quantPre;
+        intriParams.reluEn = false;
+        intriParams.unitFlag = unitFlag;
+
+        const uint32_t logicalRow = static_cast<uint32_t>(tla::get<0>(dstTensor.coord()));
+        intriParams.subBlockId = logicalRow >= GMM1_TILE_M ? 1U : 0U;
+
+        // Strip the logical target-AIV band so both physical AIV UBs are
+        // addressed at tile offset zero (gate/up keep their own bases).
+        const auto logicalDstOffset = dstTensor.layout()(dstTensor.coord());
+        const auto dstOffset = logicalDstOffset % GMM1_TILE_ELEMENTS;
+        const auto srcOffset = srcTensor.layout()(srcTensor.coord());
+        AscendC::Fixpipe<ElementDst, ElementSrc, CFG_ROW_MAJOR_UB>(dstTensor.data()[dstOffset],
+                                                                   srcTensor.data()[srcOffset], intriParams);
+    }
+};
+
+template <class WeightLayout>
+struct PackedBF16TileCopyTlaToDualAivUB
+    : public Catlass::Gemm::Tile::PackedTileCopyTla<ArchTag, bfloat16_t, Catlass::layout::RowMajor, bfloat16_t,
+                                                    WeightLayout, bfloat16_t, Catlass::layout::RowMajor, void> {
+    using Base = Catlass::Gemm::Tile::PackedTileCopyTla<ArchTag, bfloat16_t, Catlass::layout::RowMajor, bfloat16_t,
+                                                        WeightLayout, bfloat16_t, Catlass::layout::RowMajor, void>;
+    using TensorL0C = typename Base::TensorL0C;
+
+    template <class TensorC>
+    using CopyL0CToDst = CopyL0CToDualAivUBFwdTla<TensorL0C, TensorC>;
+};
+
+template <uint32_t GmmIndex, bool TransW = true, bool GmOutput = false, bool DualAiv = false>
 class ForwardGroupMatmulParam {
 public:
     static_assert(GmmIndex < 2, "GMM1/GMM2 must target AIV0/AIV1");
+    static_assert(!DualAiv || (GmmIndex == 0 && !GmOutput),
+                  "Dual-AIV fixpipe routing applies to the fused-UB GMM1 path only");
     using WeightLayout = std::conditional_t<TransW, Catlass::layout::ColumnMajor, Catlass::layout::RowMajor>;
     using TileCopy = std::conditional_t<GmOutput, ForwardGmTileCopy<WeightLayout>,
-                                        PackedBF16TileCopyTlaToTargetUB<GmmIndex, WeightLayout>>;
+                                        std::conditional_t<DualAiv,
+                                                           PackedBF16TileCopyTlaToDualAivUB<WeightLayout>,
+                                                           PackedBF16TileCopyTlaToTargetUB<GmmIndex, WeightLayout>>>;
     using MmadL1TileShape = std::conditional_t<GmmIndex == 0, Gmm1L1TileShape, L1TileShape>;
     using MmadL0TileShape = std::conditional_t<GmmIndex == 0, Gmm1L0TileShape, L0TileShape>;
     static constexpr uint32_t kTileRows = GmmIndex == 0 ? GMM1_TILE_M : L1_TILE_M;
@@ -247,13 +301,14 @@ public:
 };
 
 template <bool DispatchTileReady = false, bool WaitForFullExpert = false,
-          uint32_t SaveMode = MegaMoeBF16Training::kSaveMxFp8, bool TransW = true, typename TopkWeightT = bfloat16_t>
+          uint32_t SaveMode = MegaMoeBF16Training::kSaveMxFp8, bool TransW = true,
+          bool DualAiv = false, typename TopkWeightT = bfloat16_t>
 __aicore__ inline void GroupMatmulSwiglu(
-    ForwardGroupMatmulParam<0, TransW>& gmm1Params,
+    ForwardGroupMatmulParam<0, TransW, false, DualAiv>& gmm1Params,
     MegaMoeBF16Impl::BlockEpilogueSwigluForwardBF16<Gmm1L1TileShape, true, TopkWeightT>& epilogueOp,
     const Params& params, const AscendC::Shape<int64_t, int64_t, int64_t, int64_t>& problemShape,
-    const GMMAddrInfo& gmmAddrInfo, uint32_t& startBlockIdx, int32_t& vecSetSyncCom, uint32_t expertIdx,
-    bool useTileReady, uint32_t readyBlocksPerProducerPartition)
+    const GMMAddrInfo& gmmAddrInfo, uint32_t& startBlockIdx, int32_t& vecSetSyncCom, uint32_t& nextTargetAiv,
+    int32_t& outstandingMask, uint32_t expertIdx, bool useTileReady, uint32_t readyBlocksPerProducerPartition)
 {
     using ReadyLayout = MegaMoeBF16Training::ForwardDispatchTileReadyLayout;
     static_assert(ReadyLayout::kReadyRows % GMM1_TILE_M == 0,
@@ -279,8 +334,13 @@ __aicore__ inline void GroupMatmulSwiglu(
     auto layoutA = tla::MakeLayout<bfloat16_t, Catlass::layout::RowMajor>(m, k);
     auto tensorA = tla::MakeTensor(aGlobal, layoutA, Catlass::Arch::PositionGM{});
     auto tensorB = tla::MakeTensor(bGlobal, gmm1Params.layoutB, Catlass::Arch::PositionGM{});
-    auto tensorUbFirst = tla::MakeTensor(gmm1Params.l0cOutUbFirst, gmm1Params.layoutC, Catlass::Arch::PositionUB{});
-    auto tensorUbSecond = tla::MakeTensor(gmm1Params.l0cOutUbSecond, gmm1Params.layoutC, Catlass::Arch::PositionUB{});
+    // Dual mode overlays a two-band logical row layout on the same UB
+    // buffers: a tile's logical base row selects the paired AIV and is
+    // stripped back to physical offset zero by the copier.
+    const uint32_t ubLayoutRows = DualAiv ? 2U * GMM1_TILE_M : GMM1_TILE_M;
+    auto layoutUb = tla::MakeLayout<bfloat16_t, Catlass::layout::RowMajor>(ubLayoutRows, L1_TILE_N);
+    auto tensorUbFirst = tla::MakeTensor(gmm1Params.l0cOutUbFirst, layoutUb, Catlass::Arch::PositionUB{});
+    auto tensorUbSecond = tla::MakeTensor(gmm1Params.l0cOutUbSecond, layoutUb, Catlass::Arch::PositionUB{});
 
     BlockScheduler scheduler({m, gmm1Params.outputN, k}, Catlass::MakeCoord(GMM1_TILE_M, L1_TILE_N));
     const uint32_t coreLoops = scheduler.GetCoreLoops();
@@ -296,10 +356,17 @@ __aicore__ inline void GroupMatmulSwiglu(
                    reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.ptrFlagDispatchToGmm1),
                    params.tilingData->maxOutputSize, params.tilingData->expertPerRank, params.tilingData->epWorldSize,
                    gmm1Params.blockNum, gmm1Params.dispatchBlockNumPerEP, params.tilingData->k);
-    const bool active = g_coreType == AscendC::AIC || gmm1Params.subBlockIdx == 0;
+    // Dual-AIV parity ownership requires BOTH consumer lanes to enumerate
+    // tiles in the SAME order as the AIC; the single-consumer mode disabled
+    // the schedule on AIV1 because it never consumed tiles.
+    const bool active = g_coreType == AscendC::AIC || DualAiv || gmm1Params.subBlockIdx == 0;
     phaseSchedule.Init(phaseView, expertIdx, 0, m, gmm1Params.outputN, nStripeWidth, useTileReady && active);
     bool dispatchExpertReady = false;
     for (uint32_t loopIdx = startLoopIdx; loopIdx < coreLoops; loopIdx += gmm1Params.blockNum) {
+        // Advance once per tile on every core so the AIC fixpipe target and
+        // the AIV consumer lane stay in lockstep; parity carries across
+        // experts (same rule as the backward P1 DualAiv).
+        const uint32_t targetAiv = DualAiv ? (nextTargetAiv++ & 1U) : 0U;
         Catlass::GemmCoord blockCoord{0, 0, 0};
         if (phaseSchedule.Enabled()) {
             const auto xy = phaseSchedule.Get(loopIdx);
@@ -377,31 +444,52 @@ __aicore__ inline void GroupMatmulSwiglu(
                     }
                 }
             }
-            if (vecSetSyncCom) {
+            if constexpr (DualAiv) {
+                const int32_t targetBit = 1 << targetAiv;
+                if ((outstandingMask & targetBit) != 0) {
+                    // Slot busy: wait until the owning AIV consumed the
+                    // previous tile (backward P1 outstandingMask pattern).
+                    WaitForVector(static_cast<uint16_t>(targetAiv * FLAG_ID_MAX));
+                }
+            } else if (vecSetSyncCom) {
                 WaitForVector();
             }
             auto tensorBlockA =
                 tla::GetTile(tensorA, tla::MakeCoord(mLoc, kLoc), tla::MakeShape(actualShape.m(), actualShape.k()));
+            // Dual mode encodes the fixpipe target AIV in the logical base
+            // row; gate and up of this block share one target.
+            const uint32_t ubBaseRow = DualAiv ? targetAiv * GMM1_TILE_M : 0U;
             auto tensorBlockUbFirst =
-                tla::GetTile(tensorUbFirst, tla::MakeCoord(0, 0), tla::MakeShape(actualShape.m(), actualShape.n()));
+                tla::GetTile(tensorUbFirst, tla::MakeCoord(ubBaseRow, 0), tla::MakeShape(actualShape.m(), actualShape.n()));
             auto tensorBlockUbSecond =
-                tla::GetTile(tensorUbSecond, tla::MakeCoord(0, 0), tla::MakeShape(actualShape.m(), actualShape.n()));
+                tla::GetTile(tensorUbSecond, tla::MakeCoord(ubBaseRow, 0), tla::MakeShape(actualShape.m(), actualShape.n()));
             for (uint32_t weightBlock = 0; weightBlock < SWIGLU_N_HALF; ++weightBlock) {
                 auto tensorBlockB = tla::GetTile(tensorB, tla::MakeCoord(kLoc, nLoc + weightBlock * gmm1Params.outputN),
                                                  tla::MakeShape(actualShape.k(), actualShape.n()));
                 auto& tensorBlockUb = weightBlock == 0 ? tensorBlockUbFirst : tensorBlockUbSecond;
                 gmm1Params.blockMmad(tensorBlockA, tensorBlockB, tensorBlockUb, actualShape);
             }
-            NotifyVector();
+            if constexpr (DualAiv) {
+                NotifyVector(static_cast<uint16_t>(targetAiv * FLAG_ID_MAX));
+                outstandingMask |= 1 << targetAiv;
+            } else {
+                NotifyVector();
+            }
         }
 
         vecSetSyncCom = 1;
         if constexpr (g_coreType == AscendC::AIV) {
-            if (gmm1Params.subBlockIdx == 0) {
-                AscendC::Shape<int64_t, int64_t, int64_t, int64_t> epilogueShape{actualShape.m(), actualShape.n(), 0,
-                                                                                 0};
-                AscendC::Coord<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t> epilogueOffset{
-                    mLoc * gmm1Params.outputN + nLoc, 0, 0, 0, 0, 0};
+            AscendC::Shape<int64_t, int64_t, int64_t, int64_t> epilogueShape{actualShape.m(), actualShape.n(), 0,
+                                                                             0};
+            AscendC::Coord<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t> epilogueOffset{
+                mLoc * gmm1Params.outputN + nLoc, 0, 0, 0, 0, 0};
+            if constexpr (DualAiv) {
+                if (gmm1Params.subBlockIdx == targetAiv) {
+                    WaitForCube(static_cast<uint16_t>(targetAiv * FLAG_ID_MAX));
+                    epilogueOp.template Run<SaveMode>(epilogueShape, epilogueOffset);
+                    NotifyCube(static_cast<uint16_t>(targetAiv * FLAG_ID_MAX));
+                }
+            } else if (gmm1Params.subBlockIdx == 0) {
                 if (loopIdx == startLoopIdx) {
                 }
                 WaitForCube();
@@ -424,13 +512,14 @@ __aicore__ inline void GroupMatmulSwiglu(
 }
 
 template <bool DispatchTileReady = false, bool WaitForFullExpert = false,
-          uint32_t SaveMode = MegaMoeBF16Training::kSaveMxFp8, bool TransW = true, typename TopkWeightT = bfloat16_t>
+          uint32_t SaveMode = MegaMoeBF16Training::kSaveMxFp8, bool TransW = true,
+          bool DualAiv = false, typename TopkWeightT = bfloat16_t>
 __aicore__ inline void GroupMatmulSwigluGm(
     ForwardGroupMatmulParam<0, TransW, true>& gmm1Params,
     MegaMoeBF16Impl::BlockEpilogueSwigluForwardBF16<Gmm1L1TileShape, true, TopkWeightT>& epilogueOp,
     const Params& params, const AscendC::Shape<int64_t, int64_t, int64_t, int64_t>& problemShape,
-    const GMMAddrInfo& gmmAddrInfo, uint32_t& startBlockIdx, uint32_t expertIdx, bool useTileReady,
-    uint32_t readyBlocksPerProducerPartition, uint64_t savedElementOffset)
+    const GMMAddrInfo& gmmAddrInfo, uint32_t& startBlockIdx, uint32_t& nextTargetAiv, uint32_t expertIdx,
+    bool useTileReady, uint32_t readyBlocksPerProducerPartition, uint64_t savedElementOffset)
 {
     using ReadyLayout = MegaMoeBF16Training::ForwardDispatchTileReadyLayout;
     static_assert(ReadyLayout::kReadyRows % GMM1_TILE_M == 0,
@@ -468,11 +557,17 @@ __aicore__ inline void GroupMatmulSwigluGm(
     // entire cache line before Dispatch. Word 0 remains the Hp task counter.
     __gm__ int32_t* gmmReady = gmmAddrInfo.groupFlagList + 1;
     if constexpr (g_coreType == AscendC::AIV) {
-        if (gmm1Params.subBlockIdx == 1) {
-            startBlockIdx = (startBlockIdx + coreLoops) % gmm1Params.blockNum;
-            return;
+        if constexpr (!DualAiv) {
+            // Single-consumer mode: AIV1 skips straight to its next dispatch
+            // while AIV0 consumes this expert's tiles.
+            if (gmm1Params.subBlockIdx == 1) {
+                startBlockIdx = (startBlockIdx + coreLoops) % gmm1Params.blockNum;
+                return;
+            }
         }
-
+        // Dual mode: both lanes wait the same whole-expert readiness word,
+        // then take disjoint parity subsets of the tile loop. Per-tile
+        // single ownership (load-before-Hp-overwrite) is preserved.
         while (AscendC::ReadGmByPassDCache(gmmReady) != gmm1Params.blockNum) {
             const int64_t start = AscendC::GetSystemCycle();
             while (AscendC::GetSystemCycle() - start < 100) {
@@ -505,7 +600,10 @@ __aicore__ inline void GroupMatmulSwigluGm(
                    reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.ptrFlagDispatchToGmm1),
                    params.tilingData->maxOutputSize, params.tilingData->expertPerRank, params.tilingData->epWorldSize,
                    gmm1Params.blockNum, gmm1Params.dispatchBlockNumPerEP, params.tilingData->k);
-    const bool active = g_coreType == AscendC::AIC || gmm1Params.subBlockIdx == 0;
+    // Dual-AIV parity ownership requires BOTH consumer lanes to enumerate
+    // tiles in the SAME order as the AIC; the single-consumer mode disabled
+    // the schedule on AIV1 because it never consumed tiles.
+    const bool active = g_coreType == AscendC::AIC || DualAiv || gmm1Params.subBlockIdx == 0;
     phaseSchedule.Init(phaseView, expertIdx, 0, m, gmm1Params.outputN, nStripeWidth, useTileReady && active);
     bool dispatchExpertReady = false;
     for (uint32_t loopIdx = startLoopIdx; loopIdx < coreLoops; loopIdx += gmm1Params.blockNum) {
@@ -600,9 +698,12 @@ __aicore__ inline void GroupMatmulSwigluGm(
             }
         }
 
-        // No UB producer/consumer handshake on the GM path.
+        // No UB producer/consumer handshake on the GM path. Dual mode: the
+        // parity sequence is identical on both AIV lanes (each iterates the
+        // full loop), so each tile has exactly one owner.
         if constexpr (g_coreType == AscendC::AIV) {
-            if (gmm1Params.subBlockIdx == 0) {
+            const uint32_t targetAiv = DualAiv ? (nextTargetAiv++ & 1U) : 0U;
+            if (gmm1Params.subBlockIdx == targetAiv) {
                 AscendC::Shape<int64_t, int64_t, int64_t, int64_t> epilogueShape{actualShape.m(), actualShape.n(), 0,
                                                                                  0};
                 AscendC::Coord<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t> epilogueOffset{

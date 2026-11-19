@@ -157,6 +157,12 @@ private:
     int32_t dispatchRows_ = 0;
     int32_t gmm1VecSetSyncCom_ = 0;
     int32_t gmm2VecSetSyncCom_ = 0;
+    // Dual-AIV GMM1 epilogue alternation state (UB path uses the pair; GM
+    // path uses the parity counter; carried across experts, reset each
+    // kernel launch like the other vec sync members).
+    uint32_t gmm1NextTargetAiv_ = 0;
+    int32_t gmm1OutstandingMask_ = 0;
+    uint32_t gmm1GmNextTargetAiv_ = 0;
     uint32_t startBlockIdx_ = 0;
     uint32_t dispatchBlockNumPerEP_ = 2;
     int32_t perRankStridesInTokenPerExpert_ = 0;
@@ -1179,44 +1185,122 @@ __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::ProcessWithSaveMode()
         uint32_t gmm1K = Get<K_VALUE>(problemShape_);
         epilogueOp_.UpdateNextProblem({0, gmm1N / SWIGLU_N_HALF, gmm1K, 0});
         constexpr bool useGmSwiglu = GmSwiglu;
-        MegaMoeBF16ForwardCatlassImpl::ForwardGroupMatmulParam<0, TransW, useGmSwiglu> gmm1Params(
+#if defined(DEEPEP_BF16_GMM1_DUAL_AIV) && DEEPEP_BF16_GMM1_DUAL_AIV
+        // Dual-AIV forward activation: the fused-UB path alternates fixpipe
+        // targets between the paired AIVs (backward P1 DualAiv pattern);
+        // the GM-decoupled path runs all Dispatch first (pass 1) and then
+        // splits its tile loop by lane parity (pass 2), so dispatch(k+1)
+        // overlaps GEMM(k) instead of serializing behind this lane's share
+        // of activation(k). Numerics are bitwise unchanged.
+        constexpr bool dualAivGmm1 = true;
+#else
+        constexpr bool dualAivGmm1 = false;
+#endif
+        constexpr bool useDualAivUb = dualAivGmm1 && !useGmSwiglu;
+        MegaMoeBF16ForwardCatlassImpl::ForwardGroupMatmulParam<0, TransW, useGmSwiglu, useDualAivUb> gmm1Params(
             gmm1N, gmm1K, params_.tilingData->blockNumPerEP);
-        for (uint32_t expertIdx = 0; expertIdx < expertPerRank_; expertIdx++) {
-            if (!UpdateGroupParams(expertIdx)) {
-                continue;
-            }
-            const bool useTileReady =
-                preparedPhaseEnabled_
-                    ? shapeTileReadyCandidate &&
-                          Get<M_VALUE>(problemShape_) >=
-                              MegaMoeBF16Training::ForwardDispatchTileReadyLayout::kMinReadyRowsPerExpert
-                    : MegaMoeBF16Training::ForwardDispatchTileReadyLayout::UseTileReadyForStartupExpert(
-                          shapeTileReadyCandidate, startupExpertHandled, Get<M_VALUE>(problemShape_));
-            // Each actual non-empty expert independently retains the
-            // existing small-expert fallback. No runtime sorting/search.
-            startupExpertHandled = true;
-            UpdateGlobalBuffer(gmmAddrInfo, 0);
-            if constexpr (g_coreType == AscendC::AIV) {
-                if (subBlockIdx_ == 1) {
-                    // Bypass L2 only for ordinary BF16 Dispatch packed-X stores.
-                    // GMM1 creates its own input tensor with its original read policy.
-                    GlobalTensor<QuantOutType> dispatchedX;
-                    dispatchedX.SetGlobalBuffer(reinterpret_cast<__gm__ QuantOutType*>(gmmAddrInfo.aGlobal));
-                    dispatchedX.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
-                    DispatchTokens<true, waitForFullExpert>(gmmAddrInfo, expertIdx, dispatchedX, useTileReady);
+        if constexpr (useGmSwiglu && dualAivGmm1) {
+            // Pass 1: run every expert's Dispatch first (AIV1 only; other
+            // cores just advance the cheap per-expert cursor).
+            for (uint32_t expertIdx = 0; expertIdx < expertPerRank_; expertIdx++) {
+                if (!UpdateGroupParams(expertIdx)) {
+                    continue;
+                }
+                const bool useTileReady =
+                    preparedPhaseEnabled_
+                        ? shapeTileReadyCandidate &&
+                              Get<M_VALUE>(problemShape_) >=
+                                  MegaMoeBF16Training::ForwardDispatchTileReadyLayout::kMinReadyRowsPerExpert
+                        : MegaMoeBF16Training::ForwardDispatchTileReadyLayout::UseTileReadyForStartupExpert(
+                              shapeTileReadyCandidate, startupExpertHandled, Get<M_VALUE>(problemShape_));
+                // Each actual non-empty expert independently retains the
+                // existing small-expert fallback. No runtime sorting/search.
+                startupExpertHandled = true;
+                UpdateGlobalBuffer(gmmAddrInfo, 0);
+                if constexpr (g_coreType == AscendC::AIV) {
+                    if (subBlockIdx_ == 1) {
+                        // Bypass L2 only for ordinary BF16 Dispatch packed-X stores.
+                        // GMM1 creates its own input tensor with its original read policy.
+                        GlobalTensor<QuantOutType> dispatchedX;
+                        dispatchedX.SetGlobalBuffer(reinterpret_cast<__gm__ QuantOutType*>(gmmAddrInfo.aGlobal));
+                        dispatchedX.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
+                        DispatchTokens<true, waitForFullExpert>(gmmAddrInfo, expertIdx, dispatchedX, useTileReady);
+                    }
                 }
             }
-            // Producer and consumer share one invocation-wide protocol
-            // choice. Both retain the expert-completion counter so auto
-            // mode can fall back without changing workspace layout.
-            if constexpr (useGmSwiglu) {
-                MegaMoeBF16ForwardCatlassImpl::GroupMatmulSwigluGm<true, waitForFullExpert, SaveMode, TransW>(
-                    gmm1Params, epilogueOp_, params_, problemShape_, gmmAddrInfo, startBlockIdx_, expertIdx,
-                    useTileReady, readyBlocksPerProducerPartition, Get<IDX_C_OFFSET>(baseOffset_));
-            } else {
-                MegaMoeBF16ForwardCatlassImpl::GroupMatmulSwiglu<true, waitForFullExpert, SaveMode, TransW>(
-                    gmm1Params, epilogueOp_, params_, problemShape_, gmmAddrInfo, startBlockIdx_, gmm1VecSetSyncCom_,
-                    expertIdx, useTileReady, readyBlocksPerProducerPartition);
+            // Replay the per-expert cursor from its pre-loop state and
+            // re-latch the startup-expert tile-ready decision so both passes
+            // see identical useTileReady values (dispatch and GMM1 must
+            // agree on the readiness protocol).
+            preOffset_ = 0;
+            baseOffset_ = BlockOffset{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+            startupExpertHandled = false;
+            // Pass 2: GEMM + both AIV lanes consuming disjoint parity tiles.
+            for (uint32_t expertIdx = 0; expertIdx < expertPerRank_; expertIdx++) {
+                if (!UpdateGroupParams(expertIdx)) {
+                    continue;
+                }
+                const bool useTileReady =
+                    preparedPhaseEnabled_
+                        ? shapeTileReadyCandidate &&
+                              Get<M_VALUE>(problemShape_) >=
+                                  MegaMoeBF16Training::ForwardDispatchTileReadyLayout::kMinReadyRowsPerExpert
+                        : MegaMoeBF16Training::ForwardDispatchTileReadyLayout::UseTileReadyForStartupExpert(
+                              shapeTileReadyCandidate, startupExpertHandled, Get<M_VALUE>(problemShape_));
+                startupExpertHandled = true;
+                UpdateGlobalBuffer(gmmAddrInfo, 0);
+                MegaMoeBF16ForwardCatlassImpl::GroupMatmulSwigluGm<true, waitForFullExpert, SaveMode, TransW,
+                                                                   true>(
+                    gmm1Params, epilogueOp_, params_, problemShape_, gmmAddrInfo, startBlockIdx_,
+                    gmm1GmNextTargetAiv_, expertIdx, useTileReady, readyBlocksPerProducerPartition,
+                    Get<IDX_C_OFFSET>(baseOffset_));
+            }
+        } else {
+            for (uint32_t expertIdx = 0; expertIdx < expertPerRank_; expertIdx++) {
+                if (!UpdateGroupParams(expertIdx)) {
+                    continue;
+                }
+                const bool useTileReady =
+                    preparedPhaseEnabled_
+                        ? shapeTileReadyCandidate &&
+                              Get<M_VALUE>(problemShape_) >=
+                                  MegaMoeBF16Training::ForwardDispatchTileReadyLayout::kMinReadyRowsPerExpert
+                        : MegaMoeBF16Training::ForwardDispatchTileReadyLayout::UseTileReadyForStartupExpert(
+                              shapeTileReadyCandidate, startupExpertHandled, Get<M_VALUE>(problemShape_));
+                // Each actual non-empty expert independently retains the
+                // existing small-expert fallback. No runtime sorting/search.
+                startupExpertHandled = true;
+                UpdateGlobalBuffer(gmmAddrInfo, 0);
+                if constexpr (g_coreType == AscendC::AIV) {
+                    if (subBlockIdx_ == 1) {
+                        // Bypass L2 only for ordinary BF16 Dispatch packed-X stores.
+                        // GMM1 creates its own input tensor with its original read policy.
+                        GlobalTensor<QuantOutType> dispatchedX;
+                        dispatchedX.SetGlobalBuffer(reinterpret_cast<__gm__ QuantOutType*>(gmmAddrInfo.aGlobal));
+                        dispatchedX.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
+                        DispatchTokens<true, waitForFullExpert>(gmmAddrInfo, expertIdx, dispatchedX, useTileReady);
+                    }
+                }
+                // Producer and consumer share one invocation-wide protocol
+                // choice. Both retain the expert-completion counter so auto
+                // mode can fall back without changing workspace layout.
+                if constexpr (useGmSwiglu) {
+                    MegaMoeBF16ForwardCatlassImpl::GroupMatmulSwigluGm<true, waitForFullExpert, SaveMode, TransW>(
+                        gmm1Params, epilogueOp_, params_, problemShape_, gmmAddrInfo, startBlockIdx_,
+                        gmm1GmNextTargetAiv_, expertIdx, useTileReady, readyBlocksPerProducerPartition,
+                        Get<IDX_C_OFFSET>(baseOffset_));
+                } else if constexpr (useDualAivUb) {
+                    MegaMoeBF16ForwardCatlassImpl::GroupMatmulSwiglu<true, waitForFullExpert, SaveMode, TransW,
+                                                                     true>(
+                        gmm1Params, epilogueOp_, params_, problemShape_, gmmAddrInfo, startBlockIdx_,
+                        gmm1VecSetSyncCom_, gmm1NextTargetAiv_, gmm1OutstandingMask_, expertIdx, useTileReady,
+                        readyBlocksPerProducerPartition);
+                } else {
+                    MegaMoeBF16ForwardCatlassImpl::GroupMatmulSwiglu<true, waitForFullExpert, SaveMode, TransW>(
+                        gmm1Params, epilogueOp_, params_, problemShape_, gmmAddrInfo, startBlockIdx_,
+                        gmm1VecSetSyncCom_, gmm1NextTargetAiv_, gmm1OutstandingMask_, expertIdx, useTileReady,
+                        readyBlocksPerProducerPartition);
+                }
             }
         }
     }
