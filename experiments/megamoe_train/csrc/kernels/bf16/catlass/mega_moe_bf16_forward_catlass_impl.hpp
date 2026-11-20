@@ -365,7 +365,10 @@ __aicore__ inline void GroupMatmulSwiglu(
     for (uint32_t loopIdx = startLoopIdx; loopIdx < coreLoops; loopIdx += gmm1Params.blockNum) {
         // Advance once per tile on every core so the AIC fixpipe target and
         // the AIV consumer lane stay in lockstep; parity carries across
-        // experts (same rule as the backward P1 DualAiv).
+        // experts (same rule as the backward P1 DualAiv). NOTE: the fused-UB
+        // dual path is currently unreachable (ProcessSelected routes every
+        // shape to GM while dual is on): two 192x256 tiles per lane need
+        // 192 KiB, over the 128 KiB subBlockId=1 fixpipe window.
         const uint32_t targetAiv = DualAiv ? (nextTargetAiv++ & 1U) : 0U;
         Catlass::GemmCoord blockCoord{0, 0, 0};
         if (phaseSchedule.Enabled()) {
@@ -449,6 +452,9 @@ __aicore__ inline void GroupMatmulSwiglu(
                 if ((outstandingMask & targetBit) != 0) {
                     // Slot busy: wait until the owning AIV consumed the
                     // previous tile (backward P1 outstandingMask pattern).
+                    // The AIC side MUST keep the FLAG_ID_MAX lane bits: the
+                    // hardware decodes a bare AIC-side id as targeting lane 0
+                    // (a bare lane-1 id hangs the paired AIV forever).
                     WaitForVector(static_cast<uint16_t>(targetAiv * FLAG_ID_MAX));
                 }
             } else if (vecSetSyncCom) {
@@ -484,6 +490,13 @@ __aicore__ inline void GroupMatmulSwiglu(
             AscendC::Coord<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t> epilogueOffset{
                 mLoc * gmm1Params.outputN + nLoc, 0, 0, 0, 0, 0};
             if constexpr (DualAiv) {
+                // Committed handshake form, kept verbatim: under the
+                // lane-scoped cross-core event model the AIV-side lane bit
+                // is redundant, so targetAiv * FLAG_ID_MAX pairs with the
+                // AIC's identically encoded notify exactly as a bare id
+                // would. Events were exonerated for the fused-path errors
+                // (root cause: the 128 KiB subBlockId=1 fixpipe window);
+                // keep this function's functional diff against HEAD empty.
                 if (gmm1Params.subBlockIdx == targetAiv) {
                     WaitForCube(static_cast<uint16_t>(targetAiv * FLAG_ID_MAX));
                     epilogueOp.template Run<SaveMode>(epilogueShape, epilogueOffset);
