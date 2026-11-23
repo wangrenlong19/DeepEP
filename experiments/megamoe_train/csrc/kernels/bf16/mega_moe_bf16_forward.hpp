@@ -1098,16 +1098,10 @@ template <typename TopkWeightT>
 template <uint32_t SaveMode, bool TransW>
 __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::ProcessSelected()
 {
-    // With GMM1 dual-AIV enabled the fused UB handoff is unreachable: the
-    // per-lane footprint (two 192x256 tiles = 192 KiB) exceeds the 128 KiB
-    // CO2->UB fixpipe window of subBlockId=1, so route every shape through
-    // the GM-decoupled path (its dual tile split never touches that window).
-#if defined(DEEPEP_BF16_GMM1_DUAL_AIV) && DEEPEP_BF16_GMM1_DUAL_AIV
-    const bool useGmSwigluPath = true;
-#else
-    const bool useGmSwigluPath = MegaMoeBF16Training::ForwardUsesGmSwiglu(k_, SaveMode);
-#endif
-    if (useGmSwigluPath) {
+    // ForwardUsesGmSwiglu itself carries the GMM1 dual-AIV override (every
+    // shape routes to the GM-decoupled path; see mega_moe_layout.hpp), so
+    // this dispatcher needs no dual-specific logic.
+    if (MegaMoeBF16Training::ForwardUsesGmSwiglu(k_, SaveMode)) {
         ProcessWithSaveMode<SaveMode, TransW, true>();
     } else {
         ProcessWithSaveMode<SaveMode, TransW, false>();

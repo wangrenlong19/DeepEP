@@ -152,8 +152,18 @@ constexpr uint64_t kForwardSwigluAutoBoundary = 3584;
 MEGA_MOE_BF16_HOST_DEVICE constexpr bool ForwardUsesGmSwiglu(uint64_t hidden, uint32_t savedMode,
                                                              uint32_t mode = DEEPEP_BF16_SWIGLU_DECOUPLE)
 {
+    // GMM1 dual-AIV routes every shape through the GM-decoupled path: the
+    // fused UB handoff needs two 192x256 tiles (192 KiB) per lane, beyond
+    // the 128 KiB CO2->UB fixpipe window of subBlockId=1. The override lives
+    // HERE — the single decision point shared by host workspace sizing
+    // (ForwardSwigluExtraBytes), the host decoupled query, and device
+    // routing — so allocation and execution can never disagree.
+#if defined(DEEPEP_BF16_GMM1_DUAL_AIV) && DEEPEP_BF16_GMM1_DUAL_AIV
+    return true;
+#else
     return mode == 1 || (mode == 2 && (hidden < kForwardSwigluAutoBoundary ||
                                        (hidden == kForwardSwigluAutoBoundary && savedMode == kSaveMxFp8)));
+#endif
 }
 
 MEGA_MOE_BF16_HOST_DEVICE constexpr uint64_t ForwardSwigluExtraBytes(uint64_t n, uint64_t maxRecvTokens,
