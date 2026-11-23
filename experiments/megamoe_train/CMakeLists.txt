@@ -86,7 +86,11 @@ target_include_directories(megamoe_train_ext PRIVATE ${train_include} ${TORCH_IN
 separate_arguments(torch_flags NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
 target_compile_options(megamoe_train_ext PRIVATE ${torch_flags} -O2 -fstack-protector-strong)
 target_compile_definitions(megamoe_train_ext PRIVATE
-    DEEPEP_BF16_FORCE_EXPERT_READY=${train_force_expert_ready})
+    DEEPEP_BF16_FORCE_EXPERT_READY=${train_force_expert_ready}
+    # Must mirror the device build: ForwardDispatchTileReadyLayout forks
+    # kComputeRows on this define and the host sizes workspaces from the
+    # same header; a host/device define mismatch would mis-size allocations.
+    DEEPEP_BF16_GMM1_DUAL_AIV=${train_gmm1_dual_aiv})
 target_link_directories(megamoe_train_ext PRIVATE "${ASCEND_HOME_PATH}/lib64")
 target_link_libraries(megamoe_train_ext PRIVATE ${TORCH_LIBRARIES} "${TRAIN_TORCH_PYTHON}"
     "${TRAIN_TORCH_NPU}" megamoe_train_kernel shmem ascendcl ascend_runtime platform tiling_api)

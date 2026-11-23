@@ -152,18 +152,15 @@ constexpr uint64_t kForwardSwigluAutoBoundary = 3584;
 MEGA_MOE_BF16_HOST_DEVICE constexpr bool ForwardUsesGmSwiglu(uint64_t hidden, uint32_t savedMode,
                                                              uint32_t mode = DEEPEP_BF16_SWIGLU_DECOUPLE)
 {
-    // GMM1 dual-AIV routes every shape through the GM-decoupled path: the
-    // fused UB handoff needs two 192x256 tiles (192 KiB) per lane, beyond
-    // the 128 KiB CO2->UB fixpipe window of subBlockId=1. The override lives
-    // HERE — the single decision point shared by host workspace sizing
+    // Dual-AIV builds fork kComputeRows to 128 rows (see
+    // ForwardDispatchTileReadyLayout), so the fused UB handoff fits the
+    // 128 KiB subBlockId=1 fixpipe window again and the original auto
+    // selection applies unchanged in every build. This stays the single
+    // decision point shared by host workspace sizing
     // (ForwardSwigluExtraBytes), the host decoupled query, and device
-    // routing — so allocation and execution can never disagree.
-#if defined(DEEPEP_BF16_GMM1_DUAL_AIV) && DEEPEP_BF16_GMM1_DUAL_AIV
-    return true;
-#else
+    // routing.
     return mode == 1 || (mode == 2 && (hidden < kForwardSwigluAutoBoundary ||
                                        (hidden == kForwardSwigluAutoBoundary && savedMode == kSaveMxFp8)));
-#endif
 }
 
 MEGA_MOE_BF16_HOST_DEVICE constexpr uint64_t ForwardSwigluExtraBytes(uint64_t n, uint64_t maxRecvTokens,
@@ -392,8 +389,20 @@ struct BackwardDispatchProgressLayout {
 };
 
 struct ForwardDispatchTileReadyLayout {
-    // Forward computation uses M192; backward GEMMs define their own M128.
+    // GMM1 M-tile: non-dual builds keep the tuned M192. GMM1 dual-AIV builds
+    // fork to M128 because the fused UB handoff holds two tiles per paired
+    // AIV, and CO2->UB fixpipe with subBlockId=1 can only address 128 KiB —
+    // two 128x256 tiles are exactly that (the GMM2-proven footprint), two
+    // 192x256 tiles (192 KiB) are not. kReadyRows drops back to the
+    // kReservedRows baseline, so flag capacity and workspace bytes are
+    // unchanged. The host extension compiles this header with the same
+    // define (see CMakeLists target_compile_definitions) so workspace sizing
+    // and kernel indexing always agree.
+#if defined(DEEPEP_BF16_GMM1_DUAL_AIV) && DEEPEP_BF16_GMM1_DUAL_AIV
+    static constexpr uint64_t kComputeRows = 128;
+#else
     static constexpr uint64_t kComputeRows = 192;
+#endif
     static constexpr uint64_t kMaxReadyExperts = 7;
     static constexpr uint64_t kReadyRows = 2 * kComputeRows;
     // Reserve at 256-row granularity to preserve Host/backward allocation;

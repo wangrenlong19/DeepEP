@@ -1098,9 +1098,6 @@ template <typename TopkWeightT>
 template <uint32_t SaveMode, bool TransW>
 __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::ProcessSelected()
 {
-    // ForwardUsesGmSwiglu itself carries the GMM1 dual-AIV override (every
-    // shape routes to the GM-decoupled path; see mega_moe_layout.hpp), so
-    // this dispatcher needs no dual-specific logic.
     if (MegaMoeBF16Training::ForwardUsesGmSwiglu(k_, SaveMode)) {
         ProcessWithSaveMode<SaveMode, TransW, true>();
     } else {
