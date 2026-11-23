@@ -13,7 +13,8 @@ PYBIND11_MODULE(_C, module)
         .def_readonly("y", &ops::ForwardResult::y)
         .def_readonly("counts", &ops::ForwardResult::counts)
         .def_readonly("saved_state", &ops::ForwardResult::saved_state)
-        .def_readonly("dispatch_output", &ops::ForwardResult::dispatch_output);
+        .def_readonly("dispatch_output", &ops::ForwardResult::dispatch_output)
+        .def_readonly("tile_debug", &ops::ForwardResult::tile_debug);
     py::class_<ops::BackwardResult>(module, "BackwardResult")
         .def_readonly("dx", &ops::BackwardResult::dx)
         .def_readonly("dtopk_weights", &ops::BackwardResult::dtopk_weights)

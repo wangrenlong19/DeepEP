@@ -51,11 +51,15 @@ torch::Tensor AllocateForwardTransientWorkspace(
     const auto savedMode = MegaMoeBF16Training::ResolveSavedGateUpMode(tiling.savedGateUpMode, tiling.swigluLimit);
     const uint64_t extraBytes = MegaMoeBF16Training::ForwardSwigluExtraBytes(
         tiling.n, tiling.maxOutputSize, savedMode, MegaMoeBF16SwigluDecoupled(tiling.k, savedMode));
+    const uint64_t debugBytes = tiling.tileDebugN != 0U
+                                    ? MegaMoeBF16Training::ForwardTileDebugTableBytes(tiling.expertPerRank,
+                                                                                      tiling.maxOutputSize, tiling.n)
+                                    : 0U;
     TORCH_CHECK(
-        extraBytes <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) - dispatchReadyLayout.totalBytes,
+        extraBytes + debugBytes <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) - dispatchReadyLayout.totalBytes,
         "MegaMoe BF16 decoupled transient workspace exceeds int64 capacity");
 
-    return torch::empty({static_cast<int64_t>(dispatchReadyLayout.totalBytes + extraBytes)},
+    return torch::empty({static_cast<int64_t>(dispatchReadyLayout.totalBytes + extraBytes + debugBytes)},
                         like.options().dtype(torch::kUInt8));
 }
 
@@ -287,7 +291,18 @@ ForwardResult MegaMoeBF16Forward(torch::Tensor context, torch::Tensor x, torch::
                                &trainingSavedState, &dispatchOutput, &forwardTransientWorkspace}) {
         c10_npu::NPUCachingAllocator::recordStream(tensor->storage().data_ptr(), stream);
     }
-    return {y, expertTokenNums, trainingSavedState, dispatchOutput};
+    torch::Tensor tileDebug = torch::empty({0}, x.options().dtype(torch::kUInt8));
+    if (tiling.tileDebugN != 0U) {
+        const auto savedMode = MegaMoeBF16Training::ResolveSavedGateUpMode(tiling.savedGateUpMode, tiling.swigluLimit);
+        const uint64_t extraBytes = MegaMoeBF16Training::ForwardSwigluExtraBytes(
+            tiling.n, tiling.maxOutputSize, savedMode, MegaMoeBF16SwigluDecoupled(tiling.k, savedMode));
+        const uint64_t tableBytes =
+            MegaMoeBF16Training::ForwardTileDebugTableBytes(tiling.expertPerRank, tiling.maxOutputSize, tiling.n);
+        tileDebug = forwardTransientWorkspace.narrow(
+            0, static_cast<int64_t>(dispatchTileReadyLayout.totalBytes + extraBytes),
+            static_cast<int64_t>(tableBytes));
+    }
+    return {y, expertTokenNums, trainingSavedState, dispatchOutput, tileDebug};
 }
 
 BackwardResult MegaMoeBF16Backward(torch::Tensor context, torch::Tensor gradY, torch::Tensor topkWeights,

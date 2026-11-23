@@ -19,6 +19,10 @@ struct ForwardResult {
     torch::Tensor counts;
     torch::Tensor saved_state;
     torch::Tensor dispatch_output;
+    // MEGAMOE_BF16_TILE_DEBUG=1 only: per-tile partial-sum records from the
+    // transient tail (ForwardTileDebugEntries in mega_moe_layout.hpp); an
+    // empty tensor otherwise.
+    torch::Tensor tile_debug;
 };
 
 struct BackwardResult {

@@ -149,6 +149,19 @@ constexpr uint64_t kForwardSwigluAutoBoundary = 3584;
 // GM is used below 3584, or at 3584 when savedMode is kSaveMxFp8; otherwise UB.
 // The GM path makes raw Gate/Up visible before AIV0 reloads and activates them;
 // the UB path retains the paired AIC/AIV0 producer-consumer handoff.
+// GMM1 M-tile: non-dual builds keep the tuned M192. GMM1 dual-AIV builds fork
+// to M128 because the fused UB handoff holds two tiles per paired AIV, and
+// CO2->UB fixpipe with subBlockId=1 can only address 128 KiB — two 128x256
+// tiles are exactly that (the GMM2-proven footprint), two 192x256 tiles
+// (192 KiB) are not. The constant lives here — above every consumer (tile
+// fork, debug table sizing, path selection) — and ForwardDispatchTileReady
+// Layout re-exposes it as kComputeRows; host and device compile this header
+// with the same define (see CMakeLists) so sizing and indexing always agree.
+#if defined(DEEPEP_BF16_GMM1_DUAL_AIV) && DEEPEP_BF16_GMM1_DUAL_AIV
+constexpr uint64_t kForwardGmm1TileRows = 128;
+#else
+constexpr uint64_t kForwardGmm1TileRows = 192;
+#endif
 MEGA_MOE_BF16_HOST_DEVICE constexpr bool ForwardUsesGmSwiglu(uint64_t hidden, uint32_t savedMode,
                                                              uint32_t mode = DEEPEP_BF16_SWIGLU_DECOUPLE)
 {
@@ -169,6 +182,29 @@ MEGA_MOE_BF16_HOST_DEVICE constexpr uint64_t ForwardSwigluExtraBytes(uint64_t n,
     // BF16 already owns raw Gate/Up. Other modes reuse Hp for raw Gate;
     // append only raw Up, after all existing payload and control flags.
     return decoupled && savedMode != kSaveBf16 ? AlignUp(maxRecvTokens * (n / 2) * kBf16Bytes, kAlignment512) : 0;
+}
+
+// Per-tile debug forensics (enable with MEGAMOE_BF16_TILE_DEBUG=1): one
+// 384-byte record per (expert, GMM1 loop) — 3 x 128-byte rows of 64 bf16
+// fp32-accumulated partial sums: raw Gate, raw Up (emitted between
+// WaitForCube and Run) and the SwiGLU result (emitted after Run). The
+// partials stage through the SiTU Tanh scratch, so no extra UB is
+// allocated. GEMM/activation are deterministic per tile, so records from
+// a dual run and a single-lane bisect run compare bitwise per record.
+MEGA_MOE_BF16_HOST_DEVICE constexpr uint64_t kTileDebugEntryBytes = 384;
+MEGA_MOE_BF16_HOST_DEVICE constexpr uint64_t ForwardTileDebugEntries(uint64_t expertPerRank, uint64_t maxOutputSize,
+                                                                    uint64_t n)
+{
+    constexpr uint64_t kGmm1TileRows = kForwardGmm1TileRows;
+    constexpr uint64_t kGmm1TileCols = 256;  // L1_TILE_N.
+    const uint64_t loopsPerExpert =
+        ((maxOutputSize + kGmm1TileRows - 1) / kGmm1TileRows) * ((n / 2 + kGmm1TileCols - 1) / kGmm1TileCols);
+    return expertPerRank * loopsPerExpert;
+}
+MEGA_MOE_BF16_HOST_DEVICE constexpr uint64_t ForwardTileDebugTableBytes(uint64_t expertPerRank, uint64_t maxOutputSize,
+                                                                        uint64_t n)
+{
+    return ForwardTileDebugEntries(expertPerRank, maxOutputSize, n) * kTileDebugEntryBytes;
 }
 
 // Use the resolved saved mode in both host allocation and device execution.
@@ -389,20 +425,11 @@ struct BackwardDispatchProgressLayout {
 };
 
 struct ForwardDispatchTileReadyLayout {
-    // GMM1 M-tile: non-dual builds keep the tuned M192. GMM1 dual-AIV builds
-    // fork to M128 because the fused UB handoff holds two tiles per paired
-    // AIV, and CO2->UB fixpipe with subBlockId=1 can only address 128 KiB —
-    // two 128x256 tiles are exactly that (the GMM2-proven footprint), two
-    // 192x256 tiles (192 KiB) are not. kReadyRows drops back to the
-    // kReservedRows baseline, so flag capacity and workspace bytes are
-    // unchanged. The host extension compiles this header with the same
-    // define (see CMakeLists target_compile_definitions) so workspace sizing
-    // and kernel indexing always agree.
-#if defined(DEEPEP_BF16_GMM1_DUAL_AIV) && DEEPEP_BF16_GMM1_DUAL_AIV
-    static constexpr uint64_t kComputeRows = 128;
-#else
-    static constexpr uint64_t kComputeRows = 192;
-#endif
+    // kForwardGmm1TileRows (defined above, before its first consumer) carries
+    // the M192/M128 fork and its rationale. kReadyRows drops back to the
+    // kReservedRows baseline in dual builds, so flag capacity and workspace
+    // bytes are unchanged.
+    static constexpr uint64_t kComputeRows = kForwardGmm1TileRows;
     static constexpr uint64_t kMaxReadyExperts = 7;
     static constexpr uint64_t kReadyRows = 2 * kComputeRows;
     // Reserve at 256-row granularity to preserve Host/backward allocation;

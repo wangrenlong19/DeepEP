@@ -80,5 +80,9 @@ struct MegaMoeTilingData {
     uint32_t compactTokenCountExchange{0};
     // TopK weights and their gradients: 0=BF16, 1=FP32. GMM operands stay BF16.
     uint32_t topkWeightType{0};
+    // Debug forensics (MEGAMOE_BF16_TILE_DEBUG=1): the fused dual path
+    // emits per-tile partial-sum records into the transient tail (see
+    // ForwardTileDebugEntries in mega_moe_layout.hpp). Zero when clear.
+    uint32_t tileDebugN{0};
 };
 #endif

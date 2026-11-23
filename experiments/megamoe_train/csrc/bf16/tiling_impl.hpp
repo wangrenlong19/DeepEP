@@ -16,6 +16,7 @@
 #include <map>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <string>
@@ -566,6 +567,7 @@ static bool SetInitTilingData(MegaMoeTilingData& td, uint32_t m, uint32_t k, uin
     td.transW2 = true;
     td.swigluLimit = kMegaMoeSwigluLimitDisabled;
     td.savedGateUpMode = 2;  // BF16 saving defaults to raw BF16.
+    td.tileDebugN = std::getenv("MEGAMOE_BF16_TILE_DEBUG") != nullptr ? 1U : 0U;
 
     int64_t expertNum = epWorldSize * expertPerRank;
     td.moeInitRoutingTilingData.coreNum = aivNum;

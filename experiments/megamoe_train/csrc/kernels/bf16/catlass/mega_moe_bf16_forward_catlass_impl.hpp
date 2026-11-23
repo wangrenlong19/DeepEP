@@ -362,13 +362,37 @@ __aicore__ inline void GroupMatmulSwiglu(
     const bool active = g_coreType == AscendC::AIC || DualAiv || gmm1Params.subBlockIdx == 0;
     phaseSchedule.Init(phaseView, expertIdx, 0, m, gmm1Params.outputN, nStripeWidth, useTileReady && active);
     bool dispatchExpertReady = false;
+    // Debug forensics (MEGAMOE_BF16_TILE_DEBUG): the record table rides in
+    // the transient tail after the ready lines and the optional raw-Up
+    // plane; entries are (expertIdx, loopIdx) indexed, one per tile.
+    __gm__ bfloat16_t* tileDebugBase = nullptr;
+    uint32_t tileDebugLoops = 0U;
+    if constexpr (DualAiv) {
+        if (params.tilingData->tileDebugN != 0U) {
+            tileDebugLoops = Ops::Base::CeilDiv(params.tilingData->maxOutputSize, GMM1_TILE_M) *
+                             Ops::Base::CeilDiv(gmm1Params.outputN, L1_TILE_N);
+            const auto resolvedSavedMode =
+                MegaMoeBF16Training::ResolveSavedGateUpMode(params.tilingData->savedGateUpMode,
+                                                            params.tilingData->swigluLimit);
+            tileDebugBase = reinterpret_cast<__gm__ bfloat16_t*>(
+                params.workspaceInfo.ptrA2 +
+                MegaMoeBF16Training::ForwardDispatchTileReadyLayout(params.tilingData->n,
+                                                                    params.tilingData->expertPerRank,
+                                                                    params.tilingData->maxOutputSize)
+                    .totalBytes +
+                MegaMoeBF16Training::ForwardSwigluExtraBytes(params.tilingData->n, params.tilingData->maxOutputSize,
+                                                             resolvedSavedMode,
+                                                             MegaMoeBF16Training::ForwardUsesGmSwiglu(
+                                                                 params.tilingData->k, resolvedSavedMode)));
+        }
+    }
     for (uint32_t loopIdx = startLoopIdx; loopIdx < coreLoops; loopIdx += gmm1Params.blockNum) {
         // Advance once per tile on every core so the AIC fixpipe target and
         // the AIV consumer lane stay in lockstep; parity carries across
-        // experts (same rule as the backward P1 DualAiv). NOTE: the fused-UB
-        // dual path is currently unreachable (ProcessSelected routes every
-        // shape to GM while dual is on): two 192x256 tiles per lane need
-        // 192 KiB, over the 128 KiB subBlockId=1 fixpipe window.
+        // experts (same rule as the backward P1 DualAiv). Dual builds fork
+        // kComputeRows to 128 rows (ForwardDispatchTileReadyLayout), so the
+        // per-lane handoff footprint is 2 x 128x256 x 2B = 128 KiB — exactly
+        // the subBlockId=1 fixpipe window (the GMM2-proven footprint).
         const uint32_t targetAiv = DualAiv ? (nextTargetAiv++ & 1U) : 0U;
         Catlass::GemmCoord blockCoord{0, 0, 0};
         if (phaseSchedule.Enabled()) {
@@ -499,7 +523,19 @@ __aicore__ inline void GroupMatmulSwiglu(
                 // keep this function's functional diff against HEAD empty.
                 if (gmm1Params.subBlockIdx == targetAiv) {
                     WaitForCube(static_cast<uint16_t>(targetAiv * FLAG_ID_MAX));
+                    __gm__ bfloat16_t* debugEntry = nullptr;
+                    if (tileDebugBase != nullptr) {
+                        debugEntry = tileDebugBase +
+                                     (static_cast<uint64_t>(expertIdx) * tileDebugLoops + loopIdx) *
+                                         (MegaMoeBF16Training::kTileDebugEntryBytes / sizeof(bfloat16_t));
+                        epilogueOp.EmitTileSums(debugEntry, static_cast<uint16_t>(actualShape.m()),
+                                                static_cast<uint16_t>(actualShape.n()), 0U);
+                    }
                     epilogueOp.template Run<SaveMode>(epilogueShape, epilogueOffset);
+                    if (debugEntry != nullptr) {
+                        epilogueOp.EmitTileSums(debugEntry, static_cast<uint16_t>(actualShape.m()),
+                                                static_cast<uint16_t>(actualShape.n()), 1U);
+                    }
                     NotifyCube(static_cast<uint16_t>(targetAiv * FLAG_ID_MAX));
                 }
             } else if (gmm1Params.subBlockIdx == 0) {

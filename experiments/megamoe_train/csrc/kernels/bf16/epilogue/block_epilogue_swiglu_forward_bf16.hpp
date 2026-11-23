@@ -165,6 +165,57 @@ public:
         AscendC::SyncFunc<AscendC::HardEvent::MTE2_V>();
     }
 
+    // Debug forensics (MEGAMOE_BF16_TILE_DEBUG; see ForwardTileDebugEntries
+    // in mega_moe_layout.hpp): fp32-accumulate one slot into 64 bf16 partial
+    // sums staged through the SiTU Tanh scratch, then DataCopyPad them to the
+    // caller's GM record (128 bytes per slot). phase 0 reads the raw Gate
+    // (l0cOutUbFirst_) and Up (l0cOutUbSecond_) tiles — call between
+    // WaitForCube and Run; phase 1 reads the SwiGLU result from
+    // l0cOutUbFirst_ — call after Run. No extra UB: only pre-existing
+    // buffers are touched.
+    __aicore__ inline void EmitTileSums(__gm__ bfloat16_t* gmEntry, uint16_t mSize, uint16_t nSize, uint8_t phase)
+    {
+        constexpr uint16_t lanes = 256 / sizeof(float);
+        const uint16_t stride = static_cast<uint16_t>(Ops::Base::CeilAlign(uint32_t(nSize), uint32_t(16)));
+        auto* gate = (__ubuf__ bfloat16_t*)l0cOutUbFirst_.GetPhyAddr();
+        auto* up = (__ubuf__ bfloat16_t*)l0cOutUbSecond_.GetPhyAddr();
+        auto* stage = (__ubuf__ bfloat16_t*)situTanhTmp_.GetPhyAddr();
+        const uint8_t slotCount = phase == 0U ? 2U : 1U;
+        AscendC::GlobalTensor<bfloat16_t> gmT;
+        gmT.SetGlobalBuffer(gmEntry);
+        AscendC::LocalTensor<bfloat16_t> stageView{AscendC::TPosition::VECCALC, kSituTanhTmpOffset, 192};
+        for (uint8_t slot = 0; slot < slotCount; ++slot) {
+            auto* src = (slot == 0U || phase != 0U) ? gate : up;
+            const uint16_t stageOffset = static_cast<uint16_t>(phase == 0U ? slot * 64U : 128U);
+            __VEC_SCOPE__
+            {
+                AscendC::Reg::RegTensor<float> acc;
+                AscendC::Reg::Duplicate(acc, 0.F);
+                for (uint16_t row = 0; row < mSize; ++row) {
+                    uint32_t remaining = nSize;
+                    for (uint16_t col = 0; col < nSize; col += lanes) {
+                        auto mask = AscendC::Reg::UpdateMask<float>(remaining);
+                        AscendC::Reg::RegTensor<bfloat16_t> v;
+                        AscendC::Reg::RegTensor<float> vf;
+                        AscendC::Reg::DataCopy<bfloat16_t, AscendC::Reg::LoadDist::DIST_UNPACK_B16>(
+                            v, src + row * stride + col);
+                        AscendC::Reg::Cast<float, bfloat16_t, kCastBF16ToFP32>(vf, v, mask);
+                        AscendC::Reg::Add(acc, acc, vf, mask);
+                    }
+                }
+                AscendC::Reg::RegTensor<bfloat16_t> out;
+                auto all = AscendC::Reg::CreateMask<float, AscendC::Reg::MaskPattern::ALL>();
+                AscendC::Reg::Cast<bfloat16_t, float, kCastFP32ToBF16>(out, acc, all);
+                AscendC::Reg::DataCopy<bfloat16_t, AscendC::Reg::StoreDist::DIST_PACK_B32>(
+                    stage + stageOffset, out, all);
+            }
+            AscendC::SyncFunc<AscendC::HardEvent::V_MTE3>();
+            AscendC::DataCopyExtParams dump{1, 128U, 0, 0, 0};
+            AscendC::DataCopyPad(gmT[stageOffset], stageView[stageOffset], dump);
+            AscendC::SyncFunc<AscendC::HardEvent::MTE3_V>();
+        }
+    }
+
 private:
     static constexpr uint32_t kTileRows = tla::get<0>(L0TileShape_{});
     static constexpr uint32_t kTileColumns = tla::get<1>(L0TileShape_{});
@@ -514,16 +565,15 @@ private:
     static constexpr uint32_t kSituTanhGateOutOffset = kSituTanhInOffset + kSituTanhElems * sizeof(float);
     static constexpr uint32_t kSituTanhUpOutOffset = kSituTanhGateOutOffset + kSituTanhElems * sizeof(float);
     static constexpr uint32_t kSituTanhTmpBytes = 8U * 1024U;
-    static constexpr uint32_t kSituTanhEnd = kSituTanhUpOutOffset + kSituTanhElems * sizeof(float) + kSituTanhTmpBytes;
+    static constexpr uint32_t kSituTanhTmpOffset = kSituTanhUpOutOffset + kSituTanhElems * sizeof(float);
+    static constexpr uint32_t kSituTanhEnd = kSituTanhTmpOffset + kSituTanhTmpBytes;
     static_assert(kSituTanhEnd <= Catlass::Arch::Ascend950::UB_SIZE - (kTileRows * sizeof(TopkWeightT) + 31) / 32 * 32,
                   "The SiTU-GLU packaged-Tanh scratch must stay clear of the prefetched route weights");
     AscendC::LocalTensor<float> situTanhIn_{AscendC::TPosition::VECCALC, kSituTanhInOffset, kSituTanhElems};
     AscendC::LocalTensor<float> situTanhGateOut_{AscendC::TPosition::VECCALC, kSituTanhGateOutOffset,
                                                  kSituTanhElems};
     AscendC::LocalTensor<float> situTanhUpOut_{AscendC::TPosition::VECCALC, kSituTanhUpOutOffset, kSituTanhElems};
-    AscendC::LocalTensor<uint8_t> situTanhTmp_{AscendC::TPosition::VECCALC,
-                                               kSituTanhUpOutOffset + kSituTanhElems * sizeof(float),
-                                               kSituTanhTmpBytes};
+    AscendC::LocalTensor<uint8_t> situTanhTmp_{AscendC::TPosition::VECCALC, kSituTanhTmpOffset, kSituTanhTmpBytes};
     AscendC::GlobalTensor<bfloat16_t> outputGlobal_;
     AscendC::GlobalTensor<bfloat16_t> savedGateGlobal_;
     AscendC::GlobalTensor<bfloat16_t> savedUpGlobal_;
