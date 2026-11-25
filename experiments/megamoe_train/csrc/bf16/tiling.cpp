@@ -74,6 +74,20 @@ MegaMoeHostTiling MakeMegaMoeHostTiling(MegaMoeTilingData& tiling, int64_t m, in
                     "MegaMoe BF16 count reset chunk exceeds device UB capacity");
     }
 
+    // Forward Dispatch copies through a raw-bound staging window above the
+    // fixpipe region (kForwardDispatchStageBaseBytes); its footprint is a
+    // function of hidden k alone — one token row per ping slot at the
+    // kernel's hardcoded dispatchRows=1. The TPipe staging this replaced
+    // failed InitBuffer loudly for oversized k; the raw binding would
+    // overflow UB silently, so re-state that guarantee here.
+    const uint64_t dispatchStageBytes =
+        MegaMoeBF16Training::kForwardDispatchStageBaseBytes +
+        2ULL * MegaMoeBF16Training::AlignUp(static_cast<uint64_t>(k), MegaMoeBF16Training::kAlignment32) *
+            MegaMoeBF16Training::kBf16Bytes +
+        MegaMoeBF16Training::ForwardDispatchUbLayout::kTopkWeightBytes;
+    TORCH_CHECK(dispatchStageBytes <= ub_size, "MegaMoe BF16 Dispatch staging requires ", dispatchStageBytes,
+                " UB bytes for hidden k=", k, ", but the device has ", ub_size);
+
     const float normalizedSwigluLimit =
         swiglu_limit > 0.0 ? static_cast<float>(swiglu_limit) : kMegaMoeSwigluLimitDisabled;
     // Resolve the activation family once here so every caller downstream

@@ -32,6 +32,39 @@ using BlockOffset = AscendC::Shape<int64_t, int64_t, int64_t, int64_t, int64_t, 
 
 constexpr uint32_t TOPK_WEIGHT_COPY_BUFFER_BYTES = MegaMoeBF16Training::ForwardDispatchUbLayout::kTopkWeightBytes;
 
+// Dispatch staging base: three work tiles above UB offset zero, mirroring the
+// backward P0 window (BW_STAGE_BASE_BYTES). The fused dual GMM1 fixpipe fills
+// [0, 128 KiB) of each paired AIV (two 128x256 bf16 tiles — the full
+// subBlockId=1 window) and GMM2 fills the same range, so DispatchTokens must
+// copy through a raw-bound region above both: tile-ready lets the AIC fixpipe
+// expert-k tiles while AIV1 is still copying, and the last-tile visibility
+// window can leave a fixpipe in flight into the next expert's dispatch. The
+// TPipe copies below stay allocated (FirstBuffInit's byte-identical
+// allocation order also preserves the AIC-side Catlass Resource base the
+// fixpipe addressing depends on) but only the pre-Dispatch phases
+// (cumsum scan, topk gather) still use them. Nothing dispatch-side goes
+// through TPipe or the low UB region.
+constexpr uint32_t kForwardDispatchStageBaseBytes =
+    static_cast<uint32_t>(MegaMoeBF16Training::kForwardDispatchStageBaseBytes);
+// The shared constant uses literal 128x256 tiles (the layout header cannot
+// see the catlass L1 shape); pin it to this translation unit's constants so
+// a future tile-shape change fails here instead of silently desyncing the
+// host tiling check.
+static_assert(MegaMoeBF16Training::kForwardDispatchStageBaseBytes ==
+                  3ULL * MegaMoeBF16ForwardCatlassImpl::L1_TILE_M * MegaMoeBF16ForwardCatlassImpl::L1_TILE_N *
+                      sizeof(bfloat16_t),
+              "shared dispatch staging base must match the L1 tile shape");
+static_assert(2U * MegaMoeBF16ForwardCatlassImpl::L1_TILE_M * MegaMoeBF16ForwardCatlassImpl::L1_TILE_N *
+                      sizeof(bfloat16_t) <= kForwardDispatchStageBaseBytes,
+              "dispatch staging must clear the GMM2 fixpipe window");
+#if defined(DEEPEP_BF16_GMM1_DUAL_AIV) && DEEPEP_BF16_GMM1_DUAL_AIV
+static_assert(2U * MegaMoeBF16ForwardCatlassImpl::GMM1_TILE_ELEMENTS * sizeof(bfloat16_t) <=
+                  kForwardDispatchStageBaseBytes,
+              "dispatch staging must clear the fused dual GMM1 fixpipe window");
+#endif
+static_assert(kForwardDispatchStageBaseBytes <= MegaMoeBF16ForwardCatlassImpl::ArchTag::UB_SIZE,
+              "dispatch staging base must fit in UB");
+
 template <typename TopkWeightT = bfloat16_t>
 class MegaMoeBF16Forward {
 public:
@@ -290,6 +323,12 @@ __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::FirstBuffInit(TPipe* tPi
     tPipe->InitBuffer(PrevSumBuf_, layout.prevSumBytes);
     tPipe->InitBuffer(CumsumBuf_, layout.cumsumBytes);
     dispatchCopyElementsPerPing_ = layout.copyElementsPerPing;
+    // CopyTempBuf_/TopkWeightCopyBuf_ serve the pre-Dispatch phases only
+    // (prepared-phase cumsum scan, GatherRoutedTopkWeights). Dispatch itself
+    // copies through the raw staging window at kForwardDispatchStageBaseBytes;
+    // these allocations stay byte-identical to preserve the per-core TPipe
+    // layout the Catlass Resource base and fixpipe addressing are tuned
+    // against.
     tPipe->InitBuffer(CopyTempBuf_, layout.copyBytes);
     tPipe->InitBuffer(TopkWeightCopyBuf_, layout.kTopkWeightBytes);
     tPipe->InitBuffer(ResetFlagBuf_, layout.resetFlagBytes);
@@ -763,7 +802,11 @@ __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::CopyGMToGMPerTokenV2(Glo
 {
     (void)dstScale;
     constexpr int32_t BufferNum = 2;
-    LocalTensor<QuantOutType> tmpBuffer1 = CopyTempBuf_.Get<QuantOutType>();
+    // Raw-bound ping slots above the GMM1/GMM2 fixpipe windows; the ping-pong
+    // event pair (EVENT_ID0/1) is unchanged. CopyTempBuf_ remains TPipe-
+    // allocated for the pre-Dispatch cumsum scan only.
+    LocalTensor<QuantOutType> tmpBuffer1{AscendC::TPosition::VECIN, kForwardDispatchStageBaseBytes,
+                                         dispatchCopyElementsPerPing_};
     LocalTensor<QuantOutType> tmpBuffer2 = tmpBuffer1[dispatchCopyElementsPerPing_];
     auto processCount = Ops::Base::CeilDiv(rows, dispatchRows_);
     for (uint32_t processIndex = 0; processIndex < processCount; ++processIndex) {
@@ -790,7 +833,13 @@ __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::CopyGMToGMTopkWeights(Gl
                                                                               GlobalTensor<TopkWeightT> src,
                                                                               int32_t rows)
 {
-    LocalTensor<TopkWeightT> buffer = TopkWeightCopyBuf_.Get<TopkWeightT>();
+    // Same dispatch staging window as CopyGMToGMPerTokenV2's ping slots,
+    // placed after them; TopkWeightCopyBuf_ remains TPipe-allocated for the
+    // pre-Dispatch GatherRoutedTopkWeights only.
+    LocalTensor<TopkWeightT> buffer{
+        AscendC::TPosition::VECIN,
+        kForwardDispatchStageBaseBytes + 2U * dispatchCopyElementsPerPing_ * static_cast<uint32_t>(sizeof(QuantOutType)),
+        TOPK_WEIGHT_COPY_ELEMENTS};
     constexpr int32_t chunkElements = static_cast<int32_t>(TOPK_WEIGHT_COPY_ELEMENTS);
     const int32_t processCount = Ops::Base::CeilDiv(rows, chunkElements);
     for (int32_t processIndex = 0; processIndex < processCount; ++processIndex) {

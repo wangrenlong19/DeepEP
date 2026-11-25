@@ -256,6 +256,16 @@ struct ForwardDispatchUbLayout {
     }
 };
 
+// Forward dispatch staging base: three 128x256 bf16 work tiles above UB
+// offset zero, mirroring the backward P0 window (BW_STAGE_BASE_BYTES). The
+// fused dual GMM1 fixpipe and GMM2 each fill [0, 128 KiB) of the targeted
+// paired AIV — two tiles, the full subBlockId=1 window — so DispatchTokens
+// must copy through a raw-bound region above both. Defined here instead of
+// the device-only catlass impl so host tiling can validate k against the
+// same number; the device translation unit pins this value to its L1 tile
+// constants via static_assert.
+MEGA_MOE_BF16_HOST_DEVICE constexpr uint64_t kForwardDispatchStageBaseBytes = 3ULL * 128 * 256 * 2;
+
 // Ordinary BF16 Dispatch output. Packed tokens and their packed TopK weights
 // share the same row order and allocation lifetime. The framework retains
 // both for the matching backward, independently of forward transient scratch.
