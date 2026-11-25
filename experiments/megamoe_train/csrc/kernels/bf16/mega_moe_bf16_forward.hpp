@@ -1388,6 +1388,16 @@ __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::ProcessWithSaveMode()
     // cube仅等待本核AIV1(dispatch)释放UB后再进入GMM2 fixpipe；不等待AIV0(swiglu)，
     // 从而保留“gmm2与swiglu尾块并行”，swiglu逐专家由groupFlagList继续把关。
     if constexpr (g_coreType == AscendC::AIC) {
+        // Dual GMM1 的末位 lane1 credit 没有循环内消费者（outstandingMask 首个
+        // tile 跳过等待且从不清位），残留置位若带进 GMM2 会被 tile2 的 slot0
+        // 等待（catlass impl WaitForVector(pingpongIdx+FLAG_ID_MAX)）误当 tile0
+        // credit 消费，使 slot0 ping-pong 覆写保护错位一个周期。GMM2_UB_READY
+        // 通知在 AIV1 末次 GMM1 NotifyCube 之后发出，此处排干被它掩盖，临界路径
+        // 零成本。gate 用 sticky 的 outstandingMask bit1：lane1 未被投递过 tile
+        // （GM-dual/非 dual/空闲核）时 mask 恒 0，自动跳过。
+        if ((gmm1OutstandingMask_ & 2U) != 0U) {
+            WaitForVector(FLAG_ID_MAX);
+        }
         WaitForVector(GMM2_UB_READY_FLAG + FLAG_ID_MAX);
     }
 
