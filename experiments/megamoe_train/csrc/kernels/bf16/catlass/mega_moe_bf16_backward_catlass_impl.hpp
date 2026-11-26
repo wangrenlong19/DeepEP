@@ -398,6 +398,10 @@ __aicore__ inline void GMM2GradSwiGLUGradDualAiv(
                                               tla::MakeShape(actualShape.m(), actualShape.n()));
             gmm2Params.blockMmad(tensorBlockA, tensorBlockB, tensorBlockUb, actualShape);
             NotifyVector(targetEvent);
+            // Same sticky contract as the forward fused-UB GMM1: set once per
+            // lane, never cleared in-loop (parity carries across experts); the
+            // caller reads this reference back as p1OutstandingMask and drains
+            // each set lane's final pending credit at the P1 exit.
             outstandingMask |= targetBit;
         }
 

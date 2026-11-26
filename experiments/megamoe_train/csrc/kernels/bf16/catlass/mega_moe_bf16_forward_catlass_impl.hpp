@@ -365,10 +365,12 @@ __aicore__ inline void GroupMatmulSwiglu(
     for (uint32_t loopIdx = startLoopIdx; loopIdx < coreLoops; loopIdx += gmm1Params.blockNum) {
         // Advance once per tile on every core so the AIC fixpipe target and
         // the AIV consumer lane stay in lockstep; parity carries across
-        // experts (same rule as the backward P1 DualAiv). NOTE: the fused-UB
-        // dual path is currently unreachable (ProcessSelected routes every
-        // shape to GM while dual is on): two 192x256 tiles per lane need
-        // 192 KiB, over the 128 KiB subBlockId=1 fixpipe window.
+        // experts (same rule as the backward P1 DualAiv). This fused-UB dual
+        // path is live in auto builds: hidden > kForwardSwigluAutoBoundary
+        // routes here (see ForwardUsesGmSwiglu), and dual builds fork
+        // GMM1_TILE_M to 128 so two 128x256 tiles per lane exactly fit the
+        // 128 KiB subBlockId=1 fixpipe window (ForwardDispatchTileReadyLayout
+        // in mega_moe_layout.hpp).
         const uint32_t targetAiv = DualAiv ? (nextTargetAiv++ & 1U) : 0U;
         Catlass::GemmCoord blockCoord{0, 0, 0};
         if (phaseSchedule.Enabled()) {
@@ -477,6 +479,11 @@ __aicore__ inline void GroupMatmulSwiglu(
             }
             if constexpr (DualAiv) {
                 NotifyVector(static_cast<uint16_t>(targetAiv * FLAG_ID_MAX));
+                // Sticky "this slot owes one credit" bit, never cleared
+                // in-loop: parity (and the pending credit) carries across
+                // experts, so each tile's WaitForVector above retires the
+                // PREVIOUS credit and the caller's GMM1->GMM2 exit drain
+                // (gated on this mask) retires the last one.
                 outstandingMask |= 1 << targetAiv;
             } else {
                 NotifyVector();

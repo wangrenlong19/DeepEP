@@ -1336,6 +1336,9 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::Process()
         }
     }
     if (!useGmDataGrad) {
+        // vecSetSyncCom_ doubles as the P1 sticky lane-credit mask: the
+        // DualAiv epilogue phase set a bit per lane it fed. bit0/bit1 gate
+        // draining that lane's final pending credit before P2/P3.
         const int32_t p1OutstandingMask = vecSetSyncCom_;
         if constexpr (g_coreType == AscendC::AIC) {
             if ((p1OutstandingMask & 1) != 0) {
