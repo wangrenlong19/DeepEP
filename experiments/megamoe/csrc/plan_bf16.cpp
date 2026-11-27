@@ -5,6 +5,7 @@
 #include "plan.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <vector>
 
@@ -74,9 +75,42 @@ float ClampLimit(double limit)
     return limit > 0.0 ? static_cast<float>(limit) : kMegaMoeSwigluLimitDisabled;
 }
 
+MegaMoeImpl::MegaMoeActMode ActMode(const std::string& activation)
+{
+    if (activation == "swiglu") return MegaMoeImpl::MegaMoeActMode::SWIGLU;
+    TORCH_CHECK(activation == "situglu", "activation must be 'swiglu' or 'situglu'");
+    return MegaMoeImpl::MegaMoeActMode::SITU;
+}
+
+// Activation-family view of (activation, beta1, beta2). SwiGLU maps beta1
+// through the dsv4 clamp normalization (<=0 disables the clamp); SiTU-GLU
+// requires a positive beta1 (beta_gate) and encodes the linear up branch as
+// beta2 == 0 (beta_up).
+struct ActivationParams {
+    MegaMoeImpl::MegaMoeActMode actMode;
+    float beta1;
+    float beta2;
+};
+
+ActivationParams ResolveActivation(const std::string& activation, double activation_beta1, double activation_beta2)
+{
+    const auto mode = ActMode(activation);
+    if (mode == MegaMoeImpl::MegaMoeActMode::SITU) {
+        TORCH_CHECK(activation_beta1 > 0.0, "SiTU-GLU requires activation_beta1 (beta_gate) > 0");
+        TORCH_CHECK(activation_beta2 >= 0.0, "SiTU-GLU beta_up must be 0 (linear up) or positive");
+        TORCH_CHECK(std::isfinite(activation_beta1) && std::isfinite(activation_beta2) &&
+                        static_cast<float>(activation_beta1) < 1.0e30F &&
+                        static_cast<float>(activation_beta2) < 1.0e30F,
+                    "SiTU-GLU betas must be finite and far from the FLT_MAX clamp sentinel");
+        return {mode, static_cast<float>(activation_beta1), static_cast<float>(activation_beta2)};
+    }
+    return {mode, ClampLimit(activation_beta1), 0.0F};
+}
+
 BufferSizes MakeBf16Tiling(MegaMoeBf16TilingData& tiling, int64_t m, int64_t k, int64_t f, int64_t topk,
                            int64_t world_size, int64_t expert_per_rank, int64_t max_recv_tokens, int rank,
                            double swiglu_limit, const std::string& save_gmm1_output, uint32_t topk_weight_type,
+                           const std::string& activation, double activation_beta2,
                            const deepep::megamoe::PlatformInfo& platform)
 {
     using namespace MegaMoeBF16Impl;
@@ -100,10 +134,13 @@ BufferSizes MakeBf16Tiling(MegaMoeBf16TilingData& tiling, int64_t m, int64_t k, 
                     "MegaMoe BF16 count reset chunk exceeds device UB capacity");
     }
 
-    const float normalizedSwigluLimit = ClampLimit(swiglu_limit);
+    const ActivationParams act = ResolveActivation(activation, swiglu_limit, activation_beta2);
     const uint32_t saveMode = SaveMode(save_gmm1_output);
+    TORCH_CHECK(act.actMode != MegaMoeImpl::MegaMoeActMode::SITU || saveMode != kSaveMxFp8,
+                "SiTU-GLU with gmm1_save_type='mxfp8' is not supported yet");
     if (saveMode == kSaveMxFp8) {
-        const uint64_t quantUbBytes = SaveGateUpClipMasks(normalizedSwigluLimit, saveMode)
+        const uint64_t quantUbBytes =
+            (act.actMode == MegaMoeImpl::MegaMoeActMode::SWIGLU && SaveGateUpClipMasks(act.beta1, saveMode))
                                           ? SavedGateUpQuantUbLayout::totalBytesWithClipMasks
                                           : SavedGateUpQuantUbLayout::totalBytes;
         const uint64_t ubBudget = std::min<uint64_t>(ub_size, 248ULL * 1024ULL);
@@ -125,7 +162,9 @@ BufferSizes MakeBf16Tiling(MegaMoeBf16TilingData& tiling, int64_t m, int64_t k, 
     tiling.dispatchRows = 2;
     tiling.groupListType = 1;
     tiling.transW = tiling.transW2 = true;
-    tiling.swigluLimit = normalizedSwigluLimit;
+    tiling.actMode = act.actMode;
+    tiling.activationBeta1 = act.beta1;
+    tiling.activationBeta2 = act.beta2;
     tiling.savedGateUpMode = saveMode;
     TORCH_CHECK(topk_weight_type <= kTopkWeightFp32, "unsupported TopK weight type");
     tiling.topkWeightType = topk_weight_type;
@@ -205,10 +244,11 @@ MegaMoeBF16Impl::TrainingSavedStateLayout BF16Plan::MakeSavedStateLayout(const M
 {
     using namespace MegaMoeBF16Impl;
     const auto mode = tiling.savedGateUpMode;
-    return TrainingSavedStateLayout(tiling.m, k, tiling.topK, tiling.epWorldSize, tiling.expertPerRank, max_recv_tokens,
-                                    n, mode == kSaveMxFp8, mode != kSaveNone,
-                                    SaveGateUpClipMasks(tiling.swigluLimit, mode), false,
-                                    TopkWeightBytes(tiling.topkWeightType));
+    return TrainingSavedStateLayout(
+        tiling.m, k, tiling.topK, tiling.epWorldSize, tiling.expertPerRank, max_recv_tokens, n, mode == kSaveMxFp8,
+        mode != kSaveNone,
+        tiling.actMode == MegaMoeImpl::MegaMoeActMode::SWIGLU && SaveGateUpClipMasks(tiling.activationBeta1, mode),
+        false, TopkWeightBytes(tiling.topkWeightType));
 }
 
 BF16Plan::WeightLayout BF16Plan::ResolveWeightLayout(const torch::Tensor& weight1, const torch::Tensor& weight2,
@@ -329,7 +369,8 @@ int64_t buffer_size(int64_t max_tokens, int64_t hidden, int64_t intermediate, in
     MegaMoeBf16TilingData tiling{};
     tiling.routeWeightBeforeGmm2 = need_grad ? 1U : 0U;
     const auto host = MakeBf16Tiling(tiling, max_tokens, hidden, intermediate, topk, world, local_experts, max_recv, 0,
-                                     0.0, "bf16", MegaMoeBF16Impl::kTopkWeightFp32, GetPlatformInfo());
+                                     0.0, "bf16", MegaMoeBF16Impl::kTopkWeightFp32, "swiglu", 0.0,
+                                     GetPlatformInfo());
     const uint64_t total = host.peer_bytes;
     TORCH_CHECK(total <= uint64_t(std::numeric_limits<int64_t>::max()) - kDeviceLargePageBytes,
                 "BF16 symmetric capacity overflow");
@@ -337,7 +378,8 @@ int64_t buffer_size(int64_t max_tokens, int64_t hidden, int64_t intermediate, in
 }
 
 void BF16Plan::prepare(int64_t m, int64_t h, int64_t f, int64_t topk, int64_t local_experts, int64_t max_recv,
-                       double limit, const std::string& save_type, bool fp32_p)
+                       double limit, const std::string& save_type, bool fp32_p, const std::string& activation,
+                       double activation_beta2)
 {
     TORCH_CHECK(address_ != 0, "BF16 Plan has been closed");
     MegaMoeBf16TilingData tiling{};
@@ -349,7 +391,8 @@ void BF16Plan::prepare(int64_t m, int64_t h, int64_t f, int64_t topk, int64_t lo
     const auto host =
         MakeBf16Tiling(tiling, m, h, f, topk, world_size_, local_experts, max_recv, rank_, limit,
                        weight_before_gmm2_ ? save_type : "none",
-                       fp32_p ? MegaMoeBF16Impl::kTopkWeightFp32 : MegaMoeBF16Impl::kTopkWeightBf16, platform_);
+                       fp32_p ? MegaMoeBF16Impl::kTopkWeightFp32 : MegaMoeBF16Impl::kTopkWeightBf16, activation,
+                       activation_beta2, platform_);
     TORCH_CHECK(host.peer_bytes <= SymmetricBufferBytes(), "BF16 symmetric window is too small");
     const auto savedStateLayout = MakeSavedStateLayout(tiling, h, tiling.n, max_recv);
     const MegaMoeBF16Impl::DispatchOutputLayout dispatchOutputLayout(
@@ -372,13 +415,17 @@ void BF16Plan::prepare(int64_t m, int64_t h, int64_t f, int64_t topk, int64_t lo
 
 MegaMoeBf16TilingData BF16Plan::TilingForCall(int64_t m, int64_t k, int64_t n, int64_t topk, int64_t experts,
                                               int64_t max_recv, double limit, const std::string& mode,
-                                              uint32_t weight_type, bool trans_w)
+                                              uint32_t weight_type, bool trans_w, const std::string& activation,
+                                              double activation_beta2)
 {
+    const ActivationParams act = ResolveActivation(activation, limit, activation_beta2);
     if (!workspace_.defined() || tiling_.m != m || tiling_.k != k || tiling_.n != n || tiling_.topK != topk ||
         tiling_.expertPerRank != experts || tiling_.maxOutputSize != max_recv ||
         tiling_.topkWeightType != weight_type || tiling_.savedGateUpMode != SaveMode(mode) ||
-        tiling_.swigluLimit != ClampLimit(limit)) {
-        prepare(m, k, n / 2, topk, experts, max_recv, limit, mode, weight_type == MegaMoeBF16Impl::kTopkWeightFp32);
+        tiling_.actMode != act.actMode || tiling_.activationBeta1 != act.beta1 ||
+        tiling_.activationBeta2 != act.beta2) {
+        prepare(m, k, n / 2, topk, experts, max_recv, limit, mode, weight_type == MegaMoeBF16Impl::kTopkWeightFp32,
+                activation, activation_beta2);
     }
     auto tiling = tiling_;
     tiling.transW = tiling.transW2 = trans_w;

@@ -123,7 +123,8 @@ struct ForwardWorkspaceInfo {
             tilingData->m, tilingData->k, tilingData->topK, tilingData->epWorldSize, tilingData->expertPerRank,
             tilingData->maxOutputSize, tilingData->n, tilingData->savedGateUpMode == MegaMoeBF16Impl::kSaveMxFp8,
             tilingData->savedGateUpMode != MegaMoeBF16Impl::kSaveNone,
-            MegaMoeBF16Impl::SaveGateUpClipMasks(tilingData->swigluLimit, tilingData->savedGateUpMode),
+            tilingData->actMode == MegaMoeImpl::MegaMoeActMode::SWIGLU &&
+                MegaMoeBF16Impl::SaveGateUpClipMasks(tilingData->activationBeta1, tilingData->savedGateUpMode),
             embeddedDispatchOutput, MegaMoeBF16Impl::TopkWeightBytes(tilingData->topkWeightType));
         ptrA = embeddedDispatchOutput ? savedStateBase + savedLayout.ptrAOffset : nullptr;
         ptrcumsumMM = savedStateBase + savedLayout.cumsumOffset;

@@ -48,9 +48,13 @@ PYBIND11_MODULE(_C, module)
         .def("prepare", &BF16Plan::prepare)
         .def_property_readonly("workspace_bytes", &BF16Plan::workspace_bytes)
         .def("forward", &BF16Plan::forward, py::arg("out"), py::arg("x"), py::arg("topk_ids"), py::arg("topk_weights"),
-             py::arg("weight1"), py::arg("weight2"), py::arg("max_recv_tokens"), py::arg("swiglu_limit"),
-             py::arg("save_gmm1_output"), py::arg("capture_timer"), py::arg("save_dispatched_x") = true)
-        .def("backward", &BF16Plan::backward)
+             py::arg("weight1"), py::arg("weight2"), py::arg("max_recv_tokens"), py::arg("activation_beta1"),
+             py::arg("save_gmm1_output"), py::arg("capture_timer"), py::arg("save_dispatched_x") = true,
+             py::arg("activation") = "swiglu", py::arg("activation_beta2") = 0.0)
+        .def("backward", &BF16Plan::backward, py::arg("grad_y"), py::arg("topk_weights"), py::arg("weight1"),
+             py::arg("weight2"), py::arg("counts"), py::arg("saved_state"), py::arg("dispatch_output"),
+             py::arg("max_recv_tokens"), py::arg("activation_beta1"), py::arg("save_gmm1_output"),
+             py::arg("capture_timer"), py::arg("activation") = "swiglu", py::arg("activation_beta2") = 0.0)
         .def("close", &BF16Plan::close);
     module.def("ffts_config", [] { return shmemx_get_ffts_config(); });
     module.attr("timer_numel") = AscendTimer::TOTAL_BUFFER_SIZE;

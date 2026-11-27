@@ -30,6 +30,8 @@ class BF16Function(torch.autograd.Function):
             config.save_type,
             capture is not None,
             owner.save_dispatched_x,
+            config.activation,
+            config.beta2,
         )
         if capture is not None:
             capture.forward = result.timer
@@ -69,6 +71,8 @@ class BF16Function(torch.autograd.Function):
                 config.limit,
                 config.save_type,
                 capture is not None,
+                config.activation,
+                config.beta2,
             )
             if capture is not None:
                 capture.backward = result.timer

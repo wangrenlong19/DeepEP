@@ -11,6 +11,8 @@
 
 #include <cstdint>
 
+#include "kernels/mega_moe/common/mega_moe_constants.hpp"
+
 // P1 GMM2-grad writes one FP32 dP partial per packed row and F tile.
 // P6 reduces the partials for each row.
 // Host workspace sizing and the device epilogue use the same F-tile width.
@@ -35,8 +37,17 @@ struct MegaMoeBf16TilingData {
     bool transX;
     bool transW;
     bool transW2;
-    // dsv4 swiglu_limit clamp; kMegaMoeSwigluLimitDisabled disables it.
-    float swigluLimit;
+    // Activation family. SWIGLU keeps the dsv4 hard clamp; SITU applies the
+    // SiTU-GLU softcap to both branches.
+    MegaMoeImpl::MegaMoeActMode actMode{MegaMoeImpl::MegaMoeActMode::SWIGLU};
+    // Activation-family parameter pair, overloaded by actMode.
+    // SwiGLU: beta1 = dsv4 hard clamp limit L (the former swigluLimit field:
+    //   gate = min(gate, L), up = clamp(up, -L, L); kMegaMoeSwigluLimitDisabled
+    //   disables the clamp). beta2 is unused.
+    // SiTU-GLU: beta1 = beta_gate (softcap(g, beta1)); beta2 = beta_up
+    //   (softcap(u, beta2)); beta2 == 0 means the linear up branch.
+    float activationBeta1{kMegaMoeSwigluLimitDisabled};
+    float activationBeta2{0.0F};
     // Effective BF16 save policy: 1=none, 2=BF16, 3=MXFP8.
     uint32_t savedGateUpMode{2};
     // The Host selects the token-count exchange from EP size and the number of local experts.

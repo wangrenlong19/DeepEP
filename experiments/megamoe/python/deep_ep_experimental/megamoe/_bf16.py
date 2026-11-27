@@ -20,6 +20,55 @@ class Call:
     max_recv: int
     limit: float
     save_type: str
+    activation: str = "swiglu"
+    beta2: float = 0.0
+
+
+_KIMI_SITU_BETA_GATE_DEFAULT = 4.0
+_KIMI_SITU_BETA_UP_DEFAULT = 25.0
+
+
+def _resolve_activation(activation, clamp):
+    """Normalize (activation, activation_clamp) into (name, beta1, beta2).
+
+    SwiGLU keeps the dsv4 hard clamp: clamp is a nonnegative float or None.
+    SiTU-GLU (Kimi K3) softcaps both branches with beta * tanh(x / beta):
+    clamp is a (beta_gate, beta_up) tuple, beta_gate must be positive, and
+    beta_up of None or 0 selects the linear up branch (0.0 sentinel end to
+    end). clamp=None defaults to Kimi K3's (4.0, 25.0). A bare float with
+    situglu is rejected so the two families cannot be mixed up.
+    """
+    name = str(activation).strip().lower().replace("-", "").replace("_", "")
+    if name not in ("swiglu", "situglu"):
+        raise NotImplementedError(f"activation must be 'swiglu' or 'situglu', got {activation!r}")
+    if name == "swiglu":
+        if isinstance(clamp, (tuple, list)):
+            raise TypeError("activation_clamp for swiglu must be a float or None, not a tuple")
+        limit = 0.0 if clamp is None else float(clamp)
+        if limit < 0 or not math.isfinite(limit) or not math.isfinite(c_float(limit).value):
+            raise ValueError("activation_clamp must be a finite nonnegative float or None")
+        return name, limit, 0.0
+    if isinstance(clamp, (int, float)) and not isinstance(clamp, bool):
+        raise TypeError(
+            "activation='situglu' requires activation_clamp as a (gate, up) tuple of softcap betas, "
+            f"got a float {clamp!r}"
+        )
+    if clamp is None:
+        betas = (_KIMI_SITU_BETA_GATE_DEFAULT, _KIMI_SITU_BETA_UP_DEFAULT)
+    else:
+        if not isinstance(clamp, (tuple, list)) or len(clamp) != 2:
+            raise ValueError(f"activation_clamp for situglu must be (beta_gate, beta_up), got {clamp!r}")
+        betas = (
+            _KIMI_SITU_BETA_GATE_DEFAULT if clamp[0] is None else float(clamp[0]),
+            0.0 if clamp[1] is None else float(clamp[1]),
+        )
+    if betas[0] <= 0:
+        raise ValueError(f"activation_clamp[0] (beta_gate) must be positive, got {betas[0]!r}")
+    if betas[1] < 0:
+        raise ValueError(f"activation_clamp[1] (beta_up) must be None/0 (linear up) or positive, got {betas[1]!r}")
+    if not all(math.isfinite(v) and math.isfinite(c_float(v).value) for v in betas):
+        raise ValueError("activation_clamp betas must be finite and representable as float32")
+    return name, betas[0], betas[1]
 
 
 def validate_buffer_inputs(b, bs):
@@ -44,7 +93,7 @@ def validate_buffer_inputs(b, bs):
         raise ValueError("topk_weights must be bfloat16 or float32")
 
 
-def prepare_plan(b, bs, limit, save_type):
+def prepare_plan(b, bs, activation, beta1, beta2, save_type):
     from .api import _extension
 
     mode = b.gmm1_save_type if save_type is None else save_type
@@ -61,7 +110,9 @@ def prepare_plan(b, bs, limit, save_type):
         b.need_grad,
         b.ranks_per_node,
         mode,
-        limit,
+        activation,
+        beta1,
+        beta2,
     )
     if b._plan_key != key:
         native = require_native("BF16 MegaMoE")
@@ -82,9 +133,11 @@ def prepare_plan(b, bs, limit, save_type):
             b.num_topk,
             b.num_experts // b.group.size(),
             b.max_recv_tokens,
-            limit,
+            beta1,
             mode,
             b.topk_weights.dtype == torch.float32,
+            activation,
+            beta2,
         )
         b._plan, b._plan_key, b._plan_bs = plan, key, bs
     return b._plan
@@ -102,11 +155,9 @@ def run(y, w1, w2, b, shared_w1, shared_w2, stats, activation, clamp, fast_math)
     integer("max_recv_tokens", b.max_recv_tokens, 1, (1 << 31) - 1)
     if shared_w1 is not None or shared_w2 is not None:
         raise NotImplementedError("BF16 shared experts are not implemented")
-    if activation != "swiglu" or fast_math is not True:
-        raise NotImplementedError("BF16 supports SwiGLU and the default math configuration")
-    limit = 0.0 if clamp is None else float(clamp)
-    if limit < 0 or not math.isfinite(limit) or not math.isfinite(c_float(limit).value):
-        raise ValueError("activation_clamp must be a finite nonnegative float or None")
+    if fast_math is not True:
+        raise NotImplementedError("BF16 supports the default math configuration only")
+    activation, beta1, beta2 = _resolve_activation(activation, clamp)
     if not isinstance(y, torch.Tensor) or y.ndim != 2 or y.dtype != torch.bfloat16 or y.device != b._device:
         raise ValueError("y must be BF16 [M,H] on the buffer device")
     bs = y.shape[0]
@@ -139,19 +190,22 @@ def run(y, w1, w2, b, shared_w1, shared_w2, stats, activation, clamp, fast_math)
     if gradients and not b.need_grad:
         raise ValueError("Use a SymmBuffer with need_grad=True for differentiable BF16 calls")
     mode = b.gmm1_save_type if gradients else "none"
-    config = Call(b.max_recv_tokens, limit, mode)
+    if activation == "situglu" and mode == "mxfp8":
+        raise NotImplementedError("SiTU-GLU with gmm1_save_type='mxfp8' is not supported yet")
+    config = Call(b.max_recv_tokens, beta1, mode, activation, beta2)
     with b._lock:
         runtime = b._runtime
         runtime.ensure_alive()
         caller = runtime.use_bf16_caller_stream()
-        plan = prepare_plan(b, bs, limit, mode)
+        plan = prepare_plan(b, bs, activation, beta1, beta2, mode)
         if gradients:
             _, counts = BF16Function.apply(b, plan, config, x, ids, p, w1, w2, y)
         else:
             capture = getattr(b, "_timer_capture", None)
             if capture is not None:
                 capture.claim()
-            result = plan.forward(y, x, ids, p, w1, w2, config.max_recv, limit, mode, capture is not None, False)
+            result = plan.forward(y, x, ids, p, w1, w2, config.max_recv, beta1, mode, capture is not None, False,
+                                  activation, beta2)
             if capture is not None:
                 capture.forward = result.timer
             counts = result.counts

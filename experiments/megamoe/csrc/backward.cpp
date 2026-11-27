@@ -44,7 +44,8 @@ namespace deepep::megamoe::bf16 {
 BackwardResult BF16Plan::backward(torch::Tensor gradY, torch::Tensor topkWeights, torch::Tensor weight1,
                                   torch::Tensor weight2, torch::Tensor expertTokenNums,
                                   torch::Tensor trainingSavedState, torch::Tensor dispatchOutput, int64_t maxRecvTokens,
-                                  double swigluLimit, const std::string& save_gmm1_output, bool captureTimer)
+                                  double activationBeta1, const std::string& save_gmm1_output, bool captureTimer,
+                                  const std::string& activation, double activationBeta2)
 {
     TORCH_CHECK(address_ != 0, "training operator has been closed");
     TORCH_CHECK(weight_before_gmm2_, "BF16 backward requires a need_grad=True Plan");
@@ -76,8 +77,8 @@ BackwardResult BF16Plan::backward(torch::Tensor gradY, torch::Tensor topkWeights
     TORCH_CHECK(weight1.scalar_type() == torch::kBFloat16, "weight1 must be bfloat16");
     TORCH_CHECK(weight2.scalar_type() == torch::kBFloat16, "weight2 must be bfloat16");
     TORCH_CHECK(expertTokenNums.scalar_type() == torch::kInt32, "expert_token_nums must be int32");
-    const auto tiling = TilingForCall(m, k, n, topk, expertPerRank, maxRecvTokens, swigluLimit, save_gmm1_output,
-                                      topkWeightType, weightLayout.transW);
+    const auto tiling = TilingForCall(m, k, n, topk, expertPerRank, maxRecvTokens, activationBeta1, save_gmm1_output,
+                                      topkWeightType, weightLayout.transW, activation, activationBeta2);
     const MegaMoeBF16Impl::DispatchOutputLayout dispatchOutputLayout(k, maxRecvTokens, topkWeightBytes);
     TORCH_CHECK(dispatchOutput.scalar_type() == torch::kUInt8 &&
                     static_cast<uint64_t>(dispatchOutput.numel()) >= dispatchOutputLayout.totalBytes,

@@ -685,7 +685,19 @@ def bf16_mega_moe(
     activation_clamp=None,
     fast_math=True,
 ) -> None:
-    """Write BF16 y in place; inputs and save configuration belong to sym_buffer."""
+    """Write BF16 y in place; inputs and save configuration belong to sym_buffer.
+
+    ``activation`` selects the FFN activation family and overloads the meaning
+    of ``activation_clamp``:
+
+    - ``"swiglu"`` (default): ``activation_clamp`` is the dsv4 hard clamp
+      limit L (``gate = min(gate, L)``, ``up = clamp(up, -L, L)``) or None.
+    - ``"situglu"`` (Kimi K3 SiTU-GLU): ``activation_clamp`` is a
+      ``(beta_gate, beta_up)`` tuple of softcap limits
+      (``softcap(x, b) = b * tanh(x / b)``); ``beta_up`` of None or 0 keeps
+      the up branch linear, and ``None`` defaults to ``(4.0, 25.0)``.
+      ``gmm1_save_type='mxfp8'`` is not supported with situglu yet.
+    """
     from ._bf16 import run
 
     run(

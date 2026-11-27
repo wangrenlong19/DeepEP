@@ -309,7 +309,8 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::Init(GM_ADDR context, G
     epilogueOp_.Init({gatePlane, upPlane, savedState_.ptrSavedGateScale, savedState_.ptrSavedUpScale,
                       savedState_.ptrSavedGateHigh, savedState_.ptrSavedUpLow, savedState_.ptrSavedUpHigh,
                       bwWs_.ptrGradZ, bwWs_.ptrHp, bwWs_.ptrDpProducts, params_.workspaceInfo.ptrDispatchedTopkWeights,
-                      0, 0, tilingData->swigluLimit, savedGateUpMode_, bwWs_.ptrWideDp});
+                      0, 0, tilingData->actMode, tilingData->activationBeta1, tilingData->activationBeta2,
+                      savedGateUpMode_, bwWs_.ptrWideDp});
     epilogueOp_.UpdateNextProblem({0, n_, 0, 0});
 }
 

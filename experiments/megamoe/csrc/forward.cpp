@@ -183,8 +183,9 @@ torch::Tensor AllocateTrainingSavedState(const MegaMoeBF16Impl::TrainingSavedSta
 }  // namespace
 
 ForwardResult BF16Plan::forward(torch::Tensor out, torch::Tensor x, torch::Tensor topkIds, torch::Tensor topkWeights,
-                                torch::Tensor weight1, torch::Tensor weight2, int64_t maxRecvTokens, double swigluLimit,
-                                const std::string& save_gmm1_output, bool captureTimer, bool saveDispatchedX)
+                                torch::Tensor weight1, torch::Tensor weight2, int64_t maxRecvTokens,
+                                double activationBeta1, const std::string& save_gmm1_output, bool captureTimer,
+                                bool saveDispatchedX, const std::string& activation, double activationBeta2)
 {
     TORCH_CHECK(address_ != 0, "training operator has been closed");
     TORCH_CHECK(out.defined(), "y must be a defined output tensor");
@@ -221,8 +222,9 @@ ForwardResult BF16Plan::forward(torch::Tensor out, torch::Tensor x, torch::Tenso
     const auto weightLayout = ResolveWeightLayout(weight1, weight2, k);
     const int64_t n = weightLayout.n;
     const auto tiling =
-        TilingForCall(m, k, n, topk, expertPerRank, maxRecvTokens, swigluLimit,
-                      weight_before_gmm2_ ? save_gmm1_output : "none", topkWeightType, weightLayout.transW);
+        TilingForCall(m, k, n, topk, expertPerRank, maxRecvTokens, activationBeta1,
+                      weight_before_gmm2_ ? save_gmm1_output : "none", topkWeightType, weightLayout.transW,
+                      activation, activationBeta2);
 
     const auto savedStateLayout = MakeSavedStateLayout(tiling, k, n, maxRecvTokens);
     const MegaMoeBF16Impl::DispatchOutputLayout dispatchOutputLayout(k, maxRecvTokens, topkWeightBytes);

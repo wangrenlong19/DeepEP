@@ -15,6 +15,7 @@
 
 #include "kernel_operator.h"
 #include "epilogue/activation/swiglu_math.hpp"
+#include "epilogue/activation/situglu_math.hpp"
 #include "kernel_tiling/kernel_tiling.h"
 #include "catlass/arch/arch.hpp"
 #include "tla/layout.hpp"
@@ -59,8 +60,14 @@ public:
         GM_ADDR biasGmAddr{nullptr};
         uint32_t baseM{0};
         uint32_t baseN{0};
-        // dsv4 swiglu_limit clamp; kMegaMoeSwigluLimitDisabled disables it.
-        float swigluLimit{kMegaMoeSwigluLimitDisabled};
+        // Activation family and its parameter pair; see
+        // mega_moe_bf16_tiling.hpp for the overload contract. SwiGLU keeps
+        // the dsv4 hard clamp in activationBeta1
+        // (kMegaMoeSwigluLimitDisabled disables it); SiTU-GLU uses
+        // activationBeta1/2 as the two softcap betas.
+        MegaMoeImpl::MegaMoeActMode actMode{MegaMoeImpl::MegaMoeActMode::SWIGLU};
+        float activationBeta1{kMegaMoeSwigluLimitDisabled};
+        float activationBeta2{0.0F};
         GM_ADDR savedGateGmAddr{nullptr};
         GM_ADDR savedUpGmAddr{nullptr};
         GM_ADDR savedGateScaleGmAddr{nullptr};
@@ -124,7 +131,11 @@ public:
         }
 
         const uint32_t tileRow = static_cast<uint32_t>(Get<0>(blockCoord) / outputN_);
-        ComputeSwigluDirect(singleM, singleN, tileRow);
+        if (params_.actMode == MegaMoeImpl::MegaMoeActMode::SITU) {
+            ComputeSituDirect(singleM, singleN, tileRow);
+        } else {
+            ComputeSwigluDirect(singleM, singleN, tileRow);
+        }
 
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(0);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(0);
@@ -164,7 +175,7 @@ public:
         if constexpr (Mode == MegaMoeBF16Impl::kSaveMxFp8) {
             quantSave_.Save(gate, up, params_.savedGateGmAddr, params_.savedUpGmAddr, params_.savedGateScaleGmAddr,
                             params_.savedUpScaleGmAddr, params_.savedGateHighGmAddr, params_.savedUpLowGmAddr,
-                            params_.savedUpHighGmAddr, params_.swigluLimit, rows, cols, outputN_, dst);
+                            params_.savedUpHighGmAddr, params_.activationBeta1, rows, cols, outputN_, dst);
         } else {
             AscendC::GlobalTensor<bfloat16_t> savedGate, savedUp;
             savedGate.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(params_.savedGateGmAddr) + dst);
@@ -189,12 +200,102 @@ private:
     static_assert(2U * kTileElements * sizeof(bfloat16_t) <= Catlass::Arch::Ascend950::UB_SIZE,
                   "The BF16 SwiGLU input tiles must fit in A5 UB");
 
-    __aicore__ inline void ComputeSwigluDirect(uint16_t mSize, uint16_t nSize, uint32_t tileRow)
+    // SiTU-GLU forward with the packaged hardware tanh (staging contract and
+    // numerical convention in epilogue/activation/situglu_math.hpp). Same
+    // FP32-through and store conventions as ComputeSwigluDirect; the output
+    // overwrites the Gate tile in place. Only dispatched when
+    // actMode==SITU, which the host pairs with save modes that leave the
+    // staging region below the top-of-UB weights free.
+    __aicore__ inline void ComputeSituDirect(uint16_t mSize, uint16_t nSize, uint32_t tileRow)
     {
+        using namespace MegaMoeImpl::Activation;
+        constexpr uint16_t kRepeat = kSituTanhRepeatElements;
+        constexpr uint16_t kParts = kSituTanhParts;
+        constexpr uint16_t kPartSize = kSituTanhPartSize;
+        const SituParams situ = MakeSituParams(params_.activationBeta1, params_.activationBeta2);
+        const uint16_t repeatsPerRow =
+            static_cast<uint16_t>(Ops::Base::CeilDiv(static_cast<uint64_t>(nSize), static_cast<uint64_t>(kRepeat)));
+        const uint32_t stride = Ops::Base::CeilAlign(uint32_t(nSize), uint32_t(16));
+        auto* gate = (__ubuf__ bfloat16_t*)l0cOutUbFirst_.GetPhyAddr();
+        auto* up = (__ubuf__ bfloat16_t*)l0cOutUbSecond_.GetPhyAddr();
+        auto* tanhIn = (__ubuf__ float*)situTanhIn_.GetPhyAddr();
+        auto* tanhGateOut = (__ubuf__ float*)situTanhGateOut_.GetPhyAddr();
+        auto* tanhUpOut = (__ubuf__ float*)situTanhUpOut_.GetPhyAddr();
+        AscendC::LocalTensor<TopkWeightT> weightUb{AscendC::TPosition::VECIN, kWeightOffset, kTileRows};
+        if (params_.applyTopkWeight) {
+            AscendC::SyncFunc<AscendC::HardEvent::V_MTE2>();
+            AscendC::DataCopyExtParams p{1, uint32_t(mSize * sizeof(TopkWeightT)), 0, 0, 0};
+            AscendC::DataCopyPad(weightUb, routedTopkWeightGlobal_[tileRow], p, {});
+            AscendC::SyncFunc<AscendC::HardEvent::MTE2_V>();
+        }
+        auto* weights = (__ubuf__ TopkWeightT*)weightUb.GetPhyAddr();
+        __VEC_SCOPE__
+        {
+            for (uint16_t row = 0; row < mSize; ++row) {
+                AscendC::Reg::RegTensor<float> weightFp;
+                if (params_.applyTopkWeight) {
+                    if constexpr (std::is_same_v<TopkWeightT, float>) {
+                        AscendC::Reg::DataCopy<float, AscendC::Reg::LoadDist::DIST_BRC_B32>(weightFp, weights + row);
+                    } else {
+                        AscendC::Reg::RegTensor<bfloat16_t> weightBf;
+                        AscendC::Reg::DataCopy<bfloat16_t, AscendC::Reg::LoadDist::DIST_BRC_B16>(weightBf,
+                                                                                                 weights + row);
+                        auto all = AscendC::Reg::CreateMask<float, AscendC::Reg::MaskPattern::ALL>();
+                        AscendC::Reg::Cast<float, bfloat16_t, kCastBF16ToFP32>(weightFp, weightBf, all);
+                    }
+                }
+                uint32_t remaining = nSize;
+                for (uint16_t repeat = 0; repeat < repeatsPerRow; ++repeat) {
+                    auto mask = AscendC::Reg::UpdateMask<bfloat16_t>(remaining);
+                    AscendC::Reg::RegTensor<float> oneReg;
+                    AscendC::Reg::Duplicate(oneReg, 1.0F, mask);
+                    AscendC::Reg::RegTensor<bfloat16_t> gate0, gate1, up0, up1;
+                    AscendC::Reg::RegTensor<float> gateFp0, gateFp1, upFp0, upFp1;
+                    const uint32_t offset = row * stride + repeat * kRepeat;
+                    AscendC::Reg::DataCopy(gate0, gate + offset);
+                    AscendC::Reg::DataCopy(up0, up + offset);
+                    AscendC::Reg::Interleave(gate0, gate1, gate0, gate1);
+                    AscendC::Reg::Interleave(up0, up1, up0, up1);
+                    AscendC::Reg::Cast<float, bfloat16_t, kCastBF16ToFP32>(gateFp0, gate0, mask);
+                    AscendC::Reg::Cast<float, bfloat16_t, kCastBF16ToFP32>(gateFp1, gate1, mask);
+                    AscendC::Reg::Cast<float, bfloat16_t, kCastBF16ToFP32>(upFp0, up0, mask);
+                    AscendC::Reg::Cast<float, bfloat16_t, kCastBF16ToFP32>(upFp1, up1, mask);
+                    SituStageTanhLeg(situTanhIn_, situTanhGateOut_, situTanhTmp_, tanhIn, tanhGateOut, gateFp0,
+                                     gateFp1, situ.recipBetaGate, mask);
+                    if (!situ.linearUp) {
+                        SituStageTanhLeg(situTanhIn_, situTanhUpOut_, situTanhTmp_, tanhIn, tanhUpOut, upFp0, upFp1,
+                                         situ.recipBetaUp, mask);
+                    }
+                    for (uint16_t part = 0; part < kParts; ++part) {
+                        auto g = part == 0 ? gateFp0 : gateFp1;
+                        auto u = part == 0 ? upFp0 : upFp1;
+                        AscendC::Reg::RegTensor<float> t, a, b, value, neg, ex, den, sig;
+                        AscendC::Reg::RegTensor<bfloat16_t> rb;
+                        AscendC::Reg::DataCopy(t, tanhGateOut + part * kPartSize);
+                        SituGateActFp32(a, t, g, oneReg, neg, ex, den, sig, mask, situ.betaGate);
+                        if (situ.linearUp) {
+                            AscendC::Reg::Mul(value, a, u, mask);
+                        } else {
+                            AscendC::Reg::DataCopy(t, tanhUpOut + part * kPartSize);
+                            SituUpActFp32(b, t, mask, situ.betaUp);
+                            AscendC::Reg::Mul(value, a, b, mask);
+                        }
+                        if (params_.applyTopkWeight) AscendC::Reg::Mul(value, value, weightFp, mask);
+                        AscendC::Reg::Cast<bfloat16_t, float, kCastFP32ToBF16>(rb, value, mask);
+                        AscendC::Reg::DataCopy<bfloat16_t, AscendC::Reg::StoreDist::DIST_PACK_B32>(
+                            gate + offset + part * kPartSize, rb, mask);
+                    }
+                }
+            }
+        }
+    }
+
+    __aicore__ inline void ComputeSwigluDirect(uint16_t mSize, uint16_t nSize, uint32_t tileRow)    {
         constexpr uint16_t lanes = 256 / sizeof(float);
         const uint32_t stride = Ops::Base::CeilAlign(uint32_t(nSize), uint32_t(16));
-        const bool clip = params_.swigluLimit != kMegaMoeSwigluLimitDisabled;
-        const float limit = params_.swigluLimit;
+        const bool clip = params_.actMode == MegaMoeImpl::MegaMoeActMode::SWIGLU &&
+                          params_.activationBeta1 != kMegaMoeSwigluLimitDisabled;
+        const float limit = params_.activationBeta1;
         auto* gate = (__ubuf__ bfloat16_t*)l0cOutUbFirst_.GetPhyAddr();
         auto* up = (__ubuf__ bfloat16_t*)l0cOutUbSecond_.GetPhyAddr();
         // Place weights beyond every MXFP8 data/scale/clamp-mask buffer: Save
@@ -261,6 +362,25 @@ private:
     AscendC::LocalTensor<bfloat16_t> l0cOutUbFirst_{AscendC::TPosition::VECIN, 0, kTileElements};
     AscendC::LocalTensor<bfloat16_t> l0cOutUbSecond_{AscendC::TPosition::VECIN, kTileElements * sizeof(bfloat16_t),
                                                      kTileElements};
+    // SiTU-GLU packaged-tanh staging (ComputeSituDirect), between the
+    // Gate/Up tiles and the top-of-UB weights. QuantizedSave instantiations
+    // claim this region for MXFP8 encoding, but actMode==SITU is host-gated
+    // to save modes that never run those instantiations' situ branch.
+    static constexpr uint32_t kSituTanhOffset = 2U * kTileElements * sizeof(bfloat16_t);
+    static constexpr uint32_t kSituTanhOperandBytes = MegaMoeImpl::Activation::kSituTanhOperandBytes;
+    AscendC::LocalTensor<float> situTanhIn_{AscendC::TPosition::VECCALC, kSituTanhOffset,
+                                            MegaMoeImpl::Activation::kSituTanhRepeatElements};
+    AscendC::LocalTensor<float> situTanhGateOut_{AscendC::TPosition::VECCALC, kSituTanhOffset + kSituTanhOperandBytes,
+                                                 MegaMoeImpl::Activation::kSituTanhRepeatElements};
+    AscendC::LocalTensor<float> situTanhUpOut_{AscendC::TPosition::VECCALC,
+                                               kSituTanhOffset + 2U * kSituTanhOperandBytes,
+                                               MegaMoeImpl::Activation::kSituTanhRepeatElements};
+    AscendC::LocalTensor<uint8_t> situTanhTmp_{AscendC::TPosition::VECCALC,
+                                               kSituTanhOffset + 3U * kSituTanhOperandBytes,
+                                               MegaMoeImpl::Activation::kSituTanhTmpBytes};
+    static_assert(kSituTanhOffset + 3U * kSituTanhOperandBytes + MegaMoeImpl::Activation::kSituTanhTmpBytes <=
+                      kWeightOffset,
+                  "SiTU-GLU tanh staging must stay below the top-of-UB weights");
     AscendC::GlobalTensor<bfloat16_t> outputGlobal_;
     AscendC::GlobalTensor<TopkWeightT> routedTopkWeightGlobal_;
     __gm__ int32_t* groupFlagListGmAddr_{nullptr};

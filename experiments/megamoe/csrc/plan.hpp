@@ -81,20 +81,24 @@ public:
 
     void close();
     void prepare(int64_t m, int64_t h, int64_t f, int64_t topk, int64_t local_experts, int64_t max_recv, double limit,
-                 const std::string& save_type, bool fp32_p);
+                 const std::string& save_type, bool fp32_p, const std::string& activation = "swiglu",
+                 double activation_beta2 = 0.0);
     int64_t workspace_bytes() const
     {
         return workspace_.defined() ? workspace_.numel() : 0;
     }
 
     ForwardResult forward(torch::Tensor out, torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_weights,
-                          torch::Tensor weight1, torch::Tensor weight2, int64_t max_recv_tokens, double swiglu_limit,
-                          const std::string& save_gmm1_output, bool capture_timer, bool save_dispatched_x = true);
+                          torch::Tensor weight1, torch::Tensor weight2, int64_t max_recv_tokens,
+                          double activation_beta1, const std::string& save_gmm1_output, bool capture_timer,
+                          bool save_dispatched_x = true, const std::string& activation = "swiglu",
+                          double activation_beta2 = 0.0);
 
     BackwardResult backward(torch::Tensor grad_y, torch::Tensor topk_weights, torch::Tensor weight1,
                             torch::Tensor weight2, torch::Tensor counts, torch::Tensor saved_state,
-                            torch::Tensor dispatch_output, int64_t max_recv_tokens, double swiglu_limit,
-                            const std::string& save_gmm1_output, bool capture_timer);
+                            torch::Tensor dispatch_output, int64_t max_recv_tokens, double activation_beta1,
+                            const std::string& save_gmm1_output, bool capture_timer,
+                            const std::string& activation = "swiglu", double activation_beta2 = 0.0);
 
 private:
     struct WeightLayout {
@@ -111,7 +115,8 @@ private:
                                 const torch::Tensor& w2, int64_t max_recv, int phase, const std::string& mode);
     MegaMoeBf16TilingData TilingForCall(int64_t m, int64_t k, int64_t n, int64_t topk, int64_t experts,
                                         int64_t max_recv, double limit, const std::string& mode, uint32_t weight_type,
-                                        bool trans_w);
+                                        bool trans_w, const std::string& activation = "swiglu",
+                                        double activation_beta2 = 0.0);
     // Weak ownership lets autograd discard or replace saved tensors between calls.
     struct Allocation {
         c10::weak_intrusive_ptr<c10::StorageImpl> storage;

@@ -1270,7 +1270,8 @@ __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::ProcessWave(TPipe& first
                 SyncFunc<HardEvent::MTE2_S>();
             }
             epilogue.Init({params_.workspaceInfo.ptrA2, params_.workspaceInfo.ptrA2Scale, waveReadyBase_, waveWeights_,
-                           nullptr, nullptr, nullptr, kGmm1Rows, kPairedColumns, params_.tilingData->swigluLimit,
+                           nullptr, nullptr, nullptr, kGmm1Rows, kPairedColumns, params_.tilingData->actMode,
+                           params_.tilingData->activationBeta1, params_.tilingData->activationBeta2,
                            params_.workspaceInfo.ptrSavedGate, params_.workspaceInfo.ptrSavedUp,
                            params_.workspaceInfo.ptrSavedGateScale, params_.workspaceInfo.ptrSavedUpScale,
                            params_.workspaceInfo.ptrSavedGateHigh, params_.workspaceInfo.ptrSavedUpLow,
