@@ -15,7 +15,8 @@ import torch.nn.functional as F
 
 
 @torch.enable_grad()
-def run_reference(inputs, expert_start, chunk_rows=256, swiglu_limit=0.0, *, forward_only=False):
+def run_reference(inputs, expert_start, chunk_rows=256, swiglu_limit=0.0, *, forward_only=False,
+                  activation="swiglu", beta_gate=0.0, beta_up=0.0):
     """Return owned expert contributions; the runner reduces token results.
 
     Inputs are CPU Tensor snapshots with canonical w1=[E,2F,H], w2=[E,H,F].
@@ -66,9 +67,18 @@ def run_reference(inputs, expert_start, chunk_rows=256, swiglu_limit=0.0, *, for
             chunk_x = x[token].detach().requires_grad_(not forward_only)
             probability = p[token, route, None].detach().requires_grad_(not forward_only)
             gate, up = (chunk_x @ a.T).chunk(2, dim=-1)
-            if limit > 0:
-                gate, up = gate.clamp_max(limit), up.clamp(-limit, limit)
-            activation = F.silu(gate) * up
+            if activation == "situglu":
+                # SiTU-GLU FP64 truth: softcap(x, b) = b * tanh(x / b); the up
+                # branch stays linear when beta_up is the 0 sentinel. Autograd
+                # supplies the derivative, matching the kernel's FP32-through
+                # single-rounding convention within the tolerance gates.
+                gate_a = beta_gate * torch.tanh(gate / beta_gate) * torch.sigmoid(gate)
+                up_b = beta_up * torch.tanh(up / beta_up) if beta_up > 0 else up
+                activation = gate_a * up_b
+            else:
+                if limit > 0:
+                    gate, up = gate.clamp_max(limit), up.clamp(-limit, limit)
+                activation = F.silu(gate) * up
             if forward_only:
                 result["y"].index_add_(0, token, (activation @ b.T) * probability)
                 continue

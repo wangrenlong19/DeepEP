@@ -12,7 +12,9 @@
     "seed": 20260825,
     "data_profile": "random",
     "topk_weight_dtype": "bf16",
-    "topk_weight_values": "bf16-rounded"
+    "topk_weight_values": "bf16-rounded",
+    "activation": "swiglu",
+    "act_betas": "4.0,25"
   },
   "cases": [
     {"id": "flash_m512", "suites": ["priority", "model"], "seq": 512, "hidden": 5120, "ffn": 2304, "topk": 6, "expert_per_rank": 4, "routed_scaling_factor": 1.5, "swiglu_limit": 10.0, "covers": "Flash dimensions with reduced experts: 768 balanced rows per expert and multi-block forward/backward"},
@@ -50,6 +52,9 @@
     {"id": "gather_fp32_r32772", "suites": ["gather"], "seq": 8193, "topk_weight_dtype": "fp32", "topk_weight_values": "full-precision", "covers": "FP32 source crosses the first Gather window with a tail"},
     {"id": "gather_fp32_r65528", "suites": ["gather"], "seq": 8191, "topk": 8, "expert_per_rank": 4, "topk_weight_dtype": "fp32", "topk_weight_values": "full-precision", "covers": "FP32 source has 65528 routes, just below two Gather windows"},
     {"id": "gather_fp32_r65536", "suites": ["gather"], "seq": 8192, "topk": 8, "expert_per_rank": 4, "topk_weight_dtype": "fp32", "topk_weight_values": "full-precision", "covers": "FP32 source exactly fills two Gather windows"},
-    {"id": "gather_fp32_r65544", "suites": ["gather"], "seq": 8193, "topk": 8, "expert_per_rank": 4, "topk_weight_dtype": "fp32", "topk_weight_values": "full-precision", "covers": "FP32 source crosses into the third Gather window with a tail"}
+    {"id": "gather_fp32_r65544", "suites": ["gather"], "seq": 8193, "topk": 8, "expert_per_rank": 4, "topk_weight_dtype": "fp32", "topk_weight_values": "full-precision", "covers": "FP32 source crosses into the third Gather window with a tail"},
+    {"id": "situ_m512", "suites": ["situ"], "seq": 512, "hidden": 2560, "ffn": 1536, "topk": 4, "expert_per_rank": 4, "save_gmm1_output": "bf16", "activation": "situglu", "act_betas": "4.0,25", "covers": "SiTU-GLU softcap (beta 4/25) with BF16 save: forward epilogue, aux/grad tail path, fused full tile and the double-reference precision stack"},
+    {"id": "situ_recompute_m512", "suites": ["situ"], "seq": 512, "hidden": 2560, "ffn": 1536, "topk": 4, "expert_per_rank": 4, "save_gmm1_output": "none", "activation": "situglu", "act_betas": "4.0,25", "covers": "SiTU-GLU with save=none: GMM1 recompute regime plus the whole-row/wide-row topk-grad path"},
+    {"id": "situ_linear_m512", "suites": ["situ"], "seq": 512, "hidden": 2560, "ffn": 1536, "topk": 4, "expert_per_rank": 4, "save_gmm1_output": "bf16", "activation": "situglu", "act_betas": "4.0,", "covers": "SiTU-GLU linear-up variant (beta_up unspecified): the up branch stays linear, only the gate is softcapped"}
   ]
 }

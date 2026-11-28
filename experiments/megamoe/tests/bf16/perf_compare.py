@@ -104,6 +104,9 @@ class BaselinePlan:
         "hidden",
         "local_experts",
         "swiglu_limit",
+        "activation",
+        "beta_gate",
+        "beta_up",
         "order",
         "route_row",
         "counts",
@@ -149,6 +152,9 @@ def baseline_plan(ids, w1, w2, group, args, rank, world, mode):
     plan.group = group
     plan.tokens, plan.topk, plan.hidden = tokens, topk, args.hidden
     plan.local_experts, plan.swiglu_limit, plan.recompute = local_experts, args.swiglu_limit, mode == "none"
+    plan.activation = getattr(args, "activation", "swiglu")
+    plan.beta_gate = getattr(args, "act_beta_gate", 0.0)
+    plan.beta_up = getattr(args, "act_beta_up", 0.0)
     plan.order = order.to(ids.device)
     plan.route_row = (order // topk).to(ids.device)
     plan.counts = sent_to_us.sum(dim=0).to(ids.device)
@@ -232,7 +238,7 @@ def baseline_chain():
             )
             gate_up = _grouped_matmul(global_x, plan.weight1, counts)
             gate, up = clip_gate_up(*torch.chunk(gate_up, 2, dim=-1), plan.swiglu_limit)
-            activation = torch.nn.functional.silu(gate) * up
+            activation = plan_activation(gate, up, plan)
             if global_p.dtype == torch.float32:
                 # FP32 p must not promote the following BF16 GMM operands.
                 intermediate = (activation.float() * global_p.unsqueeze(-1)).to(activation.dtype)
@@ -274,7 +280,7 @@ def baseline_chain():
             )
             gate_up = _grouped_matmul(global_x, plan.weight1, counts) if plan.recompute else ctx.saved_tensors[2]
             gate, up = clip_gate_up(*torch.chunk(gate_up, 2, dim=-1), plan.swiglu_limit)
-            activation = torch.nn.functional.silu(gate) * up
+            activation = plan_activation(gate, up, plan)
             if global_p.dtype == torch.float32:
                 intermediate = (activation.float() * global_p.unsqueeze(-1)).to(activation.dtype)
             else:
@@ -292,9 +298,8 @@ def baseline_chain():
             with torch.enable_grad():
                 replay = gate_up.detach().requires_grad_(True)
                 replay_gate, replay_up = clip_gate_up(*torch.chunk(replay, 2, dim=-1), plan.swiglu_limit)
-                (grad_gate_up,) = torch.autograd.grad(
-                    torch.nn.functional.silu(replay_gate) * replay_up, replay, grad_activation
-                )
+                (grad_gate_up,) = torch.autograd.grad(plan_activation(replay_gate, replay_up, plan), replay,
+                                                      grad_activation)
             grad_x = _grouped_matmul(grad_gate_up, weight1_transposed, counts)
             grad_w1 = _grouped_wgrad(global_x, grad_gate_up, counts)
             grad_w1 = grad_w1.reshape(plan.weight1.shape).transpose(1, 2).contiguous()
@@ -312,7 +317,8 @@ def baseline_chain():
     return _BASELINE_CHAIN
 
 
-def fused_forward(op, x, ids, weights, w1, w2, capacity, *, save_gmm1_output, swiglu_limit, api, collect_counts=True):
+def fused_forward(op, x, ids, weights, w1, w2, capacity, *, save_gmm1_output, swiglu_limit, api,
+                  activation="swiglu", activation_clamp=None, collect_counts=True):
     """Test adapter for the unified in-place interface."""
     import torch
     from deep_ep_experimental.megamoe import bf16_mega_moe
@@ -322,8 +328,21 @@ def fused_forward(op, x, ids, weights, w1, w2, capacity, *, save_gmm1_output, sw
     op.max_recv_tokens = capacity
     y = torch.empty_like(x, requires_grad=False)
     counts = torch.zeros(w1.shape[0], dtype=torch.int32, device=x.device) if collect_counts else None
-    bf16_mega_moe(y, w1, w2, op, cumulative_local_expert_recv_stats=counts, activation_clamp=swiglu_limit)
+    # SwiGLU reuses swiglu_limit as the dsv4 clamp; SiTU-GLU takes the
+    # (beta_gate, beta_up) tuple the caller resolved.
+    clamp = swiglu_limit if activation == "swiglu" else activation_clamp
+    bf16_mega_moe(y, w1, w2, op, cumulative_local_expert_recv_stats=counts, activation=activation,
+                  activation_clamp=clamp)
     return y, counts
+
+
+def plan_activation(gate, up, plan):
+    """Small-op baseline activation; autograd differentiates both families."""
+    if getattr(plan, "activation", "swiglu") == "situglu":
+        a = plan.beta_gate * torch.tanh(gate / plan.beta_gate) * torch.sigmoid(gate)
+        b = plan.beta_up * torch.tanh(up / plan.beta_up) if plan.beta_up > 0 else up
+        return a * b
+    return torch.nn.functional.silu(gate) * up
 
 
 def profile_training_forward(forward, args, path):
@@ -390,6 +409,8 @@ def measure(op, tensors, capacity, args, mode, output):
             save_gmm1_output=args.save_gmm1_output,
             swiglu_limit=args.swiglu_limit,
             api=args.api,
+            activation=getattr(args, "activation", "swiglu"),
+            activation_clamp=getattr(args, "act_clamp", None),
             collect_counts=collect_counts,
         )
         return y, counts

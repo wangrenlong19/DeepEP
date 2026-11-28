@@ -53,7 +53,8 @@ def local_truth(inputs, args, rank):
     from cpu_reference import run_reference
 
     result = run_reference(
-        inputs, rank * args.expert_per_rank, args.chunk_rows, args.swiglu_limit, forward_only=args.inference
+        inputs, rank * args.expert_per_rank, args.chunk_rows, args.swiglu_limit, forward_only=args.inference,
+        activation=args.activation, beta_gate=args.act_beta_gate, beta_up=args.act_beta_up,
     )
     sl = slice(rank * args.seq, (rank + 1) * args.seq)
     for name in ("y",) if args.inference else ("y", "dx", "dtopk_weights"):
@@ -78,6 +79,9 @@ def prepare_references(inputs, args, rank, world, device, mode, trace, phase):
                 reference="bigop",
                 inference=args.inference,
                 trace=trace if mode == "bf16" else None,
+                activation=args.activation,
+                beta_gate=args.act_beta_gate,
+                beta_up=args.act_beta_up,
             ),
             args,
             rank,
@@ -90,7 +94,8 @@ def prepare_references(inputs, args, rank, world, device, mode, trace, phase):
     else:
         with phase("megamoe_contract_reference"):
             mixed_baseline = combine_baseline(
-                run_baseline(inputs, device, rank * args.expert_per_rank, mode, args.swiglu_limit, trace=trace),
+                run_baseline(inputs, device, rank * args.expert_per_rank, mode, args.swiglu_limit, trace=trace,
+                             activation=args.activation, beta_gate=args.act_beta_gate, beta_up=args.act_beta_up),
                 args,
                 rank,
                 world,

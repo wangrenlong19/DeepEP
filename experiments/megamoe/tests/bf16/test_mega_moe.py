@@ -78,7 +78,7 @@ def parse_args(argv=None):
         default=None,
         help="Explicit ATK ratio limits; default 5 / 1.5 / 1.5, number_count_radio stays 2",
     )
-    parser.add_argument("--suite", choices=("priority", "model", "dtype", "gather", "all"), default=None)
+    parser.add_argument("--suite", choices=("priority", "model", "dtype", "gather", "situ", "all"), default=None)
     parser.add_argument(
         "--skip-mxfp8",
         action="store_true",
@@ -138,6 +138,17 @@ def parse_args(argv=None):
     )
     parser.add_argument("--save-gmm1-output", choices=("none", "bf16", "mxfp8"), default="bf16")
     parser.add_argument("--swiglu-limit", type=float, default=0.0)
+    parser.add_argument(
+        "--activation",
+        choices=("swiglu", "situglu"),
+        default="swiglu",
+        help="FFN activation family; situglu is Kimi K3 SiTU-GLU and requires swiglu-limit <= 0",
+    )
+    parser.add_argument(
+        "--act-betas",
+        default="4.0,25",
+        help="SiTU-GLU 'beta_gate,beta_up' softcap betas; an empty up (e.g. 4.0,) keeps the up branch linear",
+    )
     parser.add_argument("--seed", type=int, default=20260825)
     parser.add_argument("--chunk-rows", type=int, default=256, help="CPU FP64 expert-row chunk size")
     parser.add_argument(
@@ -323,6 +334,23 @@ def parse_args(argv=None):
         parser.error("local-mem-size must be positive and aligned to 2 MiB")
     if "LOCAL_WORLD_SIZE" in os.environ and int(os.environ["LOCAL_WORLD_SIZE"]) != len(args.devices):
         parser.error("The device list must match torchrun's local process count")
+    # SiTU-GLU activation contract (mirrors deep_ep_experimental._bf16._resolve_activation).
+    parts = [part.strip() for part in str(args.act_betas).split(",")]
+    if len(parts) != 2:
+        parser.error("--act-betas must be 'beta_gate,beta_up' (an empty up keeps the branch linear)")
+    args.act_beta_gate = float(parts[0])
+    args.act_beta_up = float(parts[1]) if parts[1] else 0.0
+    args.act_clamp = None
+    if args.activation == "situglu":
+        if args.swiglu_limit > 0:
+            parser.error("situglu bounds both branches with its own softcap; swiglu-limit must be <= 0")
+        if args.act_beta_gate <= 0:
+            parser.error("--act-betas beta_gate must be positive for situglu")
+        if args.act_beta_up < 0:
+            parser.error("--act-betas beta_up must be 0 (linear up) or positive for situglu")
+        args.act_clamp = (args.act_beta_gate, args.act_beta_up if args.act_beta_up > 0 else None)
+    elif args.swiglu_limit < 0:
+        parser.error("swiglu-limit must be nonnegative")
     return args
 
 
@@ -337,7 +365,7 @@ def suite_cases(args, *, include_skipped=False):
         seen.add(identity)
         if not item.get("covers", "").strip():
             raise ValueError(f"Missing coverage rationale in {identity}")
-        if not item["suites"] or set(item["suites"]) - {"priority", "model", "dtype", "gather"}:
+        if not item["suites"] or set(item["suites"]) - {"priority", "model", "dtype", "gather", "situ"}:
             raise ValueError(f"Invalid suite membership in {identity}")
         unknown = set(item) - set(defaults) - {"id", "suites", "covers"}
         if unknown:
@@ -1166,6 +1194,8 @@ def execute_case(local_rank, args, rank, world, op, phase_seconds, execution_mod
             save_gmm1_output=args.save_gmm1_output,
             swiglu_limit=args.swiglu_limit,
             api=args.api,
+            activation=args.activation,
+            activation_clamp=args.act_clamp,
         )
         if not args.inference:
             y.backward(dy)
@@ -1333,6 +1363,8 @@ def collect_timer(op, tensors, capacity, args, rank, world, output):
             save_gmm1_output=args.save_gmm1_output,
             swiglu_limit=args.swiglu_limit,
             api=args.api,
+            activation=args.activation,
+            activation_clamp=args.act_clamp,
         )
         y.backward(dy)
         torch.npu.synchronize()

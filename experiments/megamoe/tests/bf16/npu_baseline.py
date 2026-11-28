@@ -109,6 +109,31 @@ def _swiglu_backward_fp32(grad_h, gate_up, limit, raw=None):
     return torch.cat((dg, du), dim=-1).to(gate_up.dtype)
 
 
+def _situ_fp32(gate_up, beta_gate, beta_up):
+    """SiTU-GLU FP32-through: A(g)=softcap(g,bg)*sigmoid(g), B(u)=softcap(u,bu)|u."""
+    gate, up = gate_up.float().chunk(2, dim=-1)
+    a = beta_gate * torch.tanh(gate / beta_gate) * torch.sigmoid(gate)
+    b = beta_up * torch.tanh(up / beta_up) if beta_up > 0 else up
+    return a * b
+
+
+def _situ_backward_fp32(grad_h, gate_up, beta_gate, beta_up):
+    """A'(g)=(1-t1^2)*sig+bg*t1*sig*(1-sig); B'(u)=1-tanh(u/bu)^2 or 1 (linear)."""
+    gate, up = gate_up.float().chunk(2, dim=-1)
+    t1 = torch.tanh(gate / beta_gate)
+    sig = torch.sigmoid(gate)
+    a = beta_gate * t1 * sig
+    b = beta_up * torch.tanh(up / beta_up) if beta_up > 0 else up
+    da = grad_h.float() * b
+    dg = da * ((1.0 - t1 * t1) * sig + beta_gate * t1 * sig * (1.0 - sig))
+    if beta_up > 0:
+        t2 = torch.tanh(up / beta_up)
+        du = (grad_h.float() * a * b) * (1.0 - t2 * t2)
+    else:
+        du = grad_h.float() * a
+    return torch.cat((dg, du), dim=-1).to(gate_up.dtype)
+
+
 @torch.no_grad()
 def run_baseline(
     inputs,
@@ -120,6 +145,9 @@ def run_baseline(
     reference="megamoe",
     trace=None,
     inference=False,
+    activation="swiglu",
+    beta_gate=0.0,
+    beta_up=0.0,
 ):
     """Run the selected reference with public w1=[E,2F,H], w2=[E,H,F].
 
@@ -163,7 +191,10 @@ def run_baseline(
     weight1 = tensor(inputs["w1"].transpose(1, 2))
     weight2 = tensor(inputs["w2"].transpose(1, 2))
     forward_z = _grouped_matmul(x, weight1, counts)
-    forward_h = _swiglu_fp32(forward_z, swiglu_limit)
+    if activation == "situglu":
+        forward_h = _situ_fp32(forward_z, beta_gate, beta_up)
+    else:
+        forward_h = _swiglu_fp32(forward_z, swiglu_limit)
     if inference:
         expert_y = _grouped_matmul(forward_h.to(forward_z.dtype), weight2, counts)
         result["routes"].append({"rows": rows, "slots": slots, "y": expert_y.cpu()})
@@ -176,13 +207,21 @@ def run_baseline(
     raw_z = _grouped_matmul(x, weight1, counts) if save_mode == "none" else forward_z
     z = _mxfp8_saved_roundtrip(raw_z) if save_mode == "mxfp8" else raw_z
     raw = raw_z if save_mode == "mxfp8" else None
-    h = _swiglu_fp32(z, swiglu_limit, raw)
+    if activation == "situglu":
+        # SiTU-GLU never clips, so no MXFP8 raw-mask variant exists; the host
+        # rejects that combination before the reference runs.
+        h = _situ_fp32(z, beta_gate, beta_up)
+    else:
+        h = _swiglu_fp32(z, swiglu_limit, raw)
     hp = (h * p.float()).to(z.dtype)
     dhp = _grouped_matmul(dy, weight2.transpose(1, 2).contiguous(), counts)
     dw2 = _grouped_wgrad(hp, dy, counts).reshape_as(weight2).transpose(1, 2).contiguous()
     dp = (dhp.float() * h).sum(dim=-1).to(p.dtype)
     grad_swiglu = dhp.float() * p.float()
-    dz = _swiglu_backward_fp32(grad_swiglu, z, swiglu_limit, raw)
+    if activation == "situglu":
+        dz = _situ_backward_fp32(grad_swiglu, z, beta_gate, beta_up)
+    else:
+        dz = _swiglu_backward_fp32(grad_swiglu, z, swiglu_limit, raw)
     dx = _grouped_matmul(dz, weight1.transpose(1, 2).contiguous(), counts)
     dw1 = _grouped_wgrad(x, dz, counts).reshape_as(weight1).transpose(1, 2).contiguous()
     if trace is not None:
